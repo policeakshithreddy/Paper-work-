@@ -65,6 +65,38 @@ enum class ThemePreference(val label: String) {
     DARK("Dark theme")
 }
 
+/**
+ * Scanner image enhancement filter modes.
+ * - [ORIGINAL]: Untouched camera capture.
+ * - [ENHANCED_COLOR]: Default color-preserving shadow normalization that keeps blue/red stamps,
+ *   signatures, and highlights intact.
+ * - [INK_SAVING_GRAYSCALE]: Optional monochrome high-contrast mode for ink-saving printing.
+ */
+enum class ScanFilterMode(val label: String, val description: String) {
+    ORIGINAL("Original", "Untouched camera capture"),
+    ENHANCED_COLOR("Enhanced Color (Default)", "Shadow-normalized while preserving color stamps & ink"),
+    INK_SAVING_GRAYSCALE("Ink-Saving Grayscale", "Optional high-contrast black & white")
+}
+
+/**
+ * Explicitly distinguishes embedded PDF text extraction from on-device OCR recognition.
+ */
+enum class TextSource(val label: String) {
+    NATIVE_PDF_LAYER("Embedded PDF Text Layer"),
+    MLKIT_OCR("On-Device ML Kit OCR"),
+    BOTH("Embedded PDF Text + ML Kit OCR"),
+    NONE("No Extracted Text")
+}
+
+/**
+ * Tracks whether a vault document can be decrypted by the active Keystore key version
+ * or whether its key version was permanently invalidated.
+ */
+enum class DocumentEncryptionStatus(val label: String) {
+    ACTIVE_READABLE("Encrypted (Readable)"),
+    UNREADABLE_KEY_INVALIDATED("Unreadable (Key Invalidated)")
+}
+
 data class PrintConfiguration(
     val pageOrder: PrintPageOrder = PrintPageOrder.NORMAL,
     val pageRangeText: String = "", // empty means all pages, or e.g. "1-3, 5"
@@ -85,11 +117,14 @@ data class ScanPageRecord(
     val originalEncryptedPath: String,
     val enhancedEncryptedPath: String,
     val activeEnhanced: Boolean = true,
+    val filterMode: ScanFilterMode = ScanFilterMode.ENHANCED_COLOR,
     val rotationDegrees: Int = 0
 )
 
 /**
  * Decrypted domain representation of a Paperwork document in the user's local vault.
+ * Keeps [nativePdfText] (embedded PDF text streams) strictly separate from [ocrRecognizedText]
+ * (ML Kit optical character recognition output).
  */
 data class PaperworkDocument(
     val id: String,
@@ -104,7 +139,33 @@ data class PaperworkDocument(
     val modifiedAt: Long,
     val lastOpenedPage: Int = 0,
     val hasNativeTextLayer: Boolean = false,
-    val extractedOcrText: String = "",
+    val nativePdfText: String = "",
+    val ocrRecognizedText: String = "",
     val scanPages: List<ScanPageRecord> = emptyList(),
-    val currentlyUsingEnhanced: Boolean = true
-)
+    val currentlyUsingEnhanced: Boolean = true,
+    val activeScanFilterMode: ScanFilterMode = ScanFilterMode.ENHANCED_COLOR,
+    val keyVersion: Int = 1,
+    val encryptionStatus: DocumentEncryptionStatus = DocumentEncryptionStatus.ACTIVE_READABLE,
+    val hasDigitalSignatures: Boolean = false
+) {
+    val combinedSearchableText: String
+        get() = buildString {
+            if (nativePdfText.isNotBlank()) append(nativePdfText)
+            if (ocrRecognizedText.isNotBlank()) {
+                if (isNotEmpty()) append("\n\n")
+                append(ocrRecognizedText)
+            }
+        }
+
+    val textSource: TextSource
+        get() = when {
+            nativePdfText.isNotBlank() && ocrRecognizedText.isNotBlank() -> TextSource.BOTH
+            nativePdfText.isNotBlank() -> TextSource.NATIVE_PDF_LAYER
+            ocrRecognizedText.isNotBlank() -> TextSource.MLKIT_OCR
+            else -> TextSource.NONE
+        }
+
+    // Backwards-compatible alias for UI snippets
+    val extractedOcrText: String
+        get() = ocrRecognizedText.ifBlank { nativePdfText }
+}

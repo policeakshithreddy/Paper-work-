@@ -101,7 +101,7 @@ fun PrintConfigSheet(
 
             // 1. Page Ordering (Normal 1 -> N vs Reverse N -> 1)
             Text(
-                text = "Page order",
+                text = "Page sequence sent to Android Print Service",
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
@@ -142,7 +142,7 @@ fun PrintConfigSheet(
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
-                            text = "Reverse printing constructs a lossless vector PDF ordered from Page ${document.pageCount} down to Page 1 before sending to Android PrintManager.",
+                            text = "Reverse ordering sends the reversed page sequence (Page ${document.pageCount} down to Page 1) to Android's print service without rasterizing vector content. Physical tray stacking depends on whether your printer outputs sheets face-up or face-down.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
@@ -270,7 +270,7 @@ fun PrintConfigSheet(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = if (pageOrder == PrintPageOrder.REVERSE) {
-                            "System Print (Reverse)"
+                            "System Print (Reverse N → 1)"
                         } else {
                             "Continue to System Print"
                         },

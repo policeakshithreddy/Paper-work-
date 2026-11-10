@@ -27,8 +27,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AddPhotoAlternate
-import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.FileUpload
@@ -89,6 +89,7 @@ fun ToolsScreen(
     onRemoveConversionPage: (Int) -> Unit,
     onUpdateConversionConfig: (String, PageSizeOption, PageOrientation, MarginSize, PdfQuality) -> Unit,
     onExportConversionToPdf: (Boolean) -> Unit,
+    onCancelConversion: () -> Unit = {},
     onLaunchScanner: () -> Unit,
     onImportPdf: () -> Unit,
     onOpenPrintDialogForDocument: (PaperworkDocument) -> Unit,
@@ -115,7 +116,7 @@ fun ToolsScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    text = "Focused document conversion, multi-page PDF creation, vector page preparation, and reverse-order printing.",
+                    text = "Focused document conversion, multi-page PDF creation, non-rasterizing page preparation, and reverse-order printing.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -165,7 +166,7 @@ fun ToolsScreen(
                                     style = MaterialTheme.typography.titleLarge
                                 )
                                 Text(
-                                    text = "A4, Letter, Legal • Portrait/Landscape • Margins & Quality",
+                                    text = "EXIF-aware • OOM-safe downsampling • A4, Letter, Legal",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -192,7 +193,6 @@ fun ToolsScreen(
                             Text("Select Images to Convert")
                         }
                     } else {
-                        // Staged Images Strip with Reorder, Rotate, and Remove
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -222,7 +222,7 @@ fun ToolsScreen(
                                 onClick = { useEnhancedForConversion = true },
                                 shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
                             ) {
-                                Text("Enhanced Document Contrast")
+                                Text("Enhanced Color Contrast")
                             }
                         }
 
@@ -402,27 +402,40 @@ fun ToolsScreen(
                             }
                         }
 
-                        Button(
-                            onClick = { onExportConversionToPdf(useEnhancedForConversion) },
-                            enabled = !conversionState.isConverting,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(56.dp)
-                                .testTag("export_converted_pdf_button"),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { onExportConversionToPdf(useEnhancedForConversion) },
+                                enabled = !conversionState.isConverting,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(56.dp)
+                                    .testTag("export_converted_pdf_button"),
+                                shape = RoundedCornerShape(16.dp)
+                            ) {
+                                if (conversionState.isConverting) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Converting...")
+                                } else {
+                                    Icon(Icons.Default.Check, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "Generate Encrypted PDF (${conversionState.pages.size})",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+
                             if (conversionState.isConverting) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(20.dp),
-                                    strokeWidth = 2.dp
-                                )
-                            } else {
-                                Icon(Icons.Default.Check, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Generate Encrypted PDF (${conversionState.pages.size} ${if (conversionState.pages.size == 1) "page" else "pages"})",
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                OutlinedButton(
+                                    onClick = onCancelConversion,
+                                    modifier = Modifier.height(56.dp)
+                                ) {
+                                    Icon(Icons.Default.Close, contentDescription = "Cancel conversion")
+                                }
                             }
                         }
                     }
@@ -443,7 +456,7 @@ fun ToolsScreen(
             FocusedToolCard(
                 icon = Icons.Default.Print,
                 title = "Print & Reverse Page Order (N → 1)",
-                description = "Print any PDF via Android PrintManager in Normal (1 → N) or Reverse (N → 1) order with custom page ranges, paper sizes, color/grayscale, and duplex options.",
+                description = "Print any PDF via Android PrintManager in Normal (1 → N) or Reverse (N → 1) page sequence with custom page ranges, paper sizes, color/grayscale, and duplex options.",
                 actionLabel = "Select Document to Print",
                 testTag = "tool_card_reverse_print",
                 onClick = { selectedDocForPrintPicker = true }
@@ -454,7 +467,7 @@ fun ToolsScreen(
             FocusedToolCard(
                 icon = Icons.Default.DocumentScanner,
                 title = "Multi-Page Document Scanner",
-                description = "Capture documents with ML Kit Document Scanner or CameraX fallback. Permanently preserves Original images alongside reversible Enhanced pages.",
+                description = "Capture documents with ML Kit Document Scanner or CameraX fallback. Includes 4-corner perspective correction, deskew, retake, and Original/Enhanced Color preservation.",
                 actionLabel = "Open Scanner Studio",
                 testTag = "tool_card_scanner",
                 onClick = onLaunchScanner
@@ -464,8 +477,8 @@ fun ToolsScreen(
         item {
             FocusedToolCard(
                 icon = Icons.Default.SwapVert,
-                title = "Lossless Vector Page Range & Rotation (PDFBox)",
-                description = "Reorder pages, reverse page sequence, extract a page range, or rotate pages on an existing PDF using Apache PDFBox without rasterizing vector text.",
+                title = "Non-Rasterizing PDF Page Range & Rotation (PDFBox)",
+                description = "Reorder pages, reverse page sequence, extract a page subset, or rotate pages on an existing PDF without rasterizing vector text, while keeping the original document untouched.",
                 actionLabel = "Prepare Existing PDF",
                 testTag = "tool_card_vector_prep",
                 onClick = {
@@ -482,9 +495,9 @@ fun ToolsScreen(
         item {
             FocusedToolCard(
                 icon = Icons.Default.TextSnippet,
-                title = "On-Device OCR & Text Selection",
-                description = "Open any scanned or text-based PDF to run on-device Google ML Kit Text Recognition, search keywords, and copy text offline.",
-                actionLabel = "Select Document for OCR",
+                title = "Embedded PDF Text & On-Device OCR",
+                description = "Open any PDF to inspect embedded vector text layers separately from on-device Google ML Kit Text Recognition.",
+                actionLabel = "Select Document",
                 testTag = "tool_card_ocr",
                 onClick = { selectedDocForPrintPicker = true }
             )
@@ -585,7 +598,7 @@ fun ToolsScreen(
         )
     }
 
-    // Vector-Preserving PDFBox Page Range / Reverse / Rotate Dialog
+    // Non-Rasterizing PDFBox Page Range / Reverse / Rotate Dialog
     val prepDoc = selectedDocForVectorPrep
     if (prepDoc != null) {
         var outputTitle by remember(prepDoc.id) { mutableStateOf("${prepDoc.title} (Prepared)") }
@@ -595,14 +608,28 @@ fun ToolsScreen(
 
         AlertDialog(
             onDismissRequest = { selectedDocForVectorPrep = null },
-            title = { Text("Vector-Preserving PDF Preparation") },
+            title = { Text("Non-Rasterizing PDF Page Preparation") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        text = "Uses Apache PDFBox-Android to reorder or extract pages from '${prepDoc.title}' without rasterizing vector text or embedded fonts.",
+                        text = "Uses Apache PDFBox-Android to reorder or extract pages from '${prepDoc.title}' without rasterizing vector text, while keeping the original document untouched in your vault and validating the output.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    if (prepDoc.hasDigitalSignatures) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.tertiaryContainer
+                        ) {
+                            Text(
+                                text = "Note: Source PDF contains digital signatures. Reordering or extracting pages creates a new unsigned copy while preserving the signed original untouched.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    }
 
                     OutlinedTextField(
                         value = outputTitle,
@@ -655,7 +682,7 @@ fun ToolsScreen(
                         selectedDocForVectorPrep = null
                     }
                 ) {
-                    Text("Save Prepared PDF")
+                    Text("Save Validated Copy")
                 }
             },
             dismissButton = {

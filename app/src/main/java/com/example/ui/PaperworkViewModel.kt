@@ -3,7 +3,7 @@ package com.example.ui
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.PointF
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
@@ -12,8 +12,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.PaperworkContainer
+import com.example.core.image.NormalizedQuadCorners
+import com.example.core.image.SafeBitmapDecoder
 import com.example.core.pdf.PageImageSpec
 import com.example.data.preferences.UserPreferencesState
+import com.example.domain.model.DocumentEncryptionStatus
 import com.example.domain.model.DocumentFilter
 import com.example.domain.model.MarginSize
 import com.example.domain.model.PageOrientation
@@ -21,9 +24,12 @@ import com.example.domain.model.PageSizeOption
 import com.example.domain.model.PaperworkDocument
 import com.example.domain.model.PdfQuality
 import com.example.domain.model.PrintConfiguration
+import com.example.domain.model.ScanFilterMode
 import com.example.domain.model.SortOption
 import com.example.domain.model.ThemePreference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -34,7 +40,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -45,13 +50,16 @@ data class StagedScanPage(
     val originalBitmap: Bitmap,
     val enhancedBitmap: Bitmap,
     val rotationDegrees: Int = 0,
-    val cropNormalized: FloatArray = floatArrayOf(0f, 0f, 1f, 1f)
+    val cropNormalized: FloatArray = floatArrayOf(0f, 0f, 1f, 1f),
+    val deskewAngleDegrees: Float = 0f
 )
 
 data class ScannerStudioState(
     val pages: List<StagedScanPage> = emptyList(),
     val selectedPageIndex: Int = 0,
     val showEnhancedPreview: Boolean = true,
+    val activeFilterMode: ScanFilterMode = ScanFilterMode.ENHANCED_COLOR,
+    val isRetakingCurrentPage: Boolean = false,
     val documentTitle: String = "",
     val selectedQuality: PdfQuality = PdfQuality.BALANCED,
     val selectedPageSize: PageSizeOption = PageSizeOption.A4,
@@ -80,6 +88,9 @@ class PaperworkViewModel(
     val cryptoManager = container.cryptoManager
     val pdfEngine = container.pdfEngine
     val printHelper = container.printHelper
+    val accessLockManager = container.accessLockManager
+
+    private var activeConversionJob: Job? = null
 
     val preferencesState: StateFlow<UserPreferencesState> = prefsRepo.preferencesFlow.stateIn(
         scope = viewModelScope,
@@ -137,7 +148,7 @@ class PaperworkViewModel(
             val matchesQuery = query.isBlank() ||
                 doc.title.contains(query, ignoreCase = true) ||
                 doc.fileName.contains(query, ignoreCase = true) ||
-                doc.extractedOcrText.contains(query, ignoreCase = true)
+                doc.combinedSearchableText.contains(query, ignoreCase = true)
 
             val matchesFilter = when (filter) {
                 DocumentFilter.ALL -> true
@@ -193,7 +204,7 @@ class PaperworkViewModel(
         _sortAscending.value = ascending
     }
 
-    // ─── Security & Salted PIN Verification ───────────────────────────────────
+    // ─── Security, Salted PIN & Biometric Access Lock ─────────────────────────
 
     fun attemptPinUnlock(inputPin: String, onResult: (Boolean, String?) -> Unit) {
         viewModelScope.launch {
@@ -230,6 +241,13 @@ class PaperworkViewModel(
         }
     }
 
+    fun onBiometricUnlockSucceeded() {
+        viewModelScope.launch {
+            prefsRepo.resetFailedPinAttempts()
+            _isSessionUnlocked.value = true
+        }
+    }
+
     fun setOrUpdatePin(newPin: String) {
         if (newPin.length != 4 || !newPin.all { it.isDigit() }) {
             showMessage("PIN must be exactly 4 digits.")
@@ -248,13 +266,35 @@ class PaperworkViewModel(
         viewModelScope.launch {
             prefsRepo.disablePin()
             _isSessionUnlocked.value = true
-            showMessage("App PIN lock disabled. Hardware AES-256-GCM encryption remains active.")
+            showMessage("App access lock disabled. Keystore AES-256-GCM encryption remains active.")
+        }
+    }
+
+    fun setBiometricUnlockEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            prefsRepo.setBiometricUnlockEnabled(enabled)
         }
     }
 
     fun lockSessionNow() {
         if (preferencesState.value.pinEnabled) {
             _isSessionUnlocked.value = false
+        }
+    }
+
+    /**
+     * Explicit user-confirmed transition from `INVALIDATED` / `RECOVERY_REQUIRED` -> `NEW_KEY_CREATED` -> `ACTIVE`.
+     * Never claims old `v{N}` documents can be decrypted by the new `v{N+1}` key.
+     */
+    fun createReplacementKeyAfterInvalidation(purgeUnreadableOldDocuments: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val newVer = cryptoManager.createReplacementKeyAfterInvalidation()
+            if (purgeUnreadableOldDocuments) {
+                repo.purgeUnreadableOldKeyDocuments(newVer)
+            }
+            cryptoManager.acknowledgeNewKeyCreated()
+            refreshStorageMetrics()
+            showMessage("Provisioned replacement Keystore key v$newVer for new documents.")
         }
     }
 
@@ -286,9 +326,9 @@ class PaperworkViewModel(
 
     fun purgeTemporaryDecryptedCache() {
         viewModelScope.launch(Dispatchers.IO) {
-            val purged = cryptoManager.purgeAllTempFiles()
+            val purged = repo.secureDocumentAccessManager.cleanupAbandonedSessions()
             refreshStorageMetrics()
-            showMessage("Wiped $purged temporary cache files.")
+            showMessage("Cleaned $purged temporary session files.")
         }
     }
 
@@ -301,7 +341,7 @@ class PaperworkViewModel(
             try {
                 repo.generateSampleDocuments()
                 refreshStorageMetrics()
-                showMessage("Added Vector PDF & Scanned Receipt (with Original/Enhanced layers).")
+                showMessage("Added Vector PDF & Scanned Receipt (with Original & Enhanced Color layers).")
             } catch (e: Exception) {
                 showMessage("Failed to create sample documents: ${e.message}")
             } finally {
@@ -357,7 +397,7 @@ class PaperworkViewModel(
         viewModelScope.launch {
             repo.deleteDocument(document)
             refreshStorageMetrics()
-            showMessage("Securely wiped '${document.title}' from vault.")
+            showMessage("Deleted '${document.title}' from vault.")
         }
     }
 
@@ -370,6 +410,7 @@ class PaperworkViewModel(
     fun toggleSavedScanEnhancement(
         document: PaperworkDocument,
         useEnhanced: Boolean,
+        filterMode: ScanFilterMode = if (useEnhanced) ScanFilterMode.ENHANCED_COLOR else ScanFilterMode.ORIGINAL,
         onCompleted: (PaperworkDocument) -> Unit = {}
     ) {
         viewModelScope.launch {
@@ -377,14 +418,14 @@ class PaperworkViewModel(
             try {
                 val updated = repo.switchScanDocumentEnhancementMode(
                     document = document,
-                    useEnhanced = useEnhanced,
+                    useEnhanced = filterMode != ScanFilterMode.ORIGINAL,
+                    filterMode = filterMode,
                     pageSize = preferencesState.value.defaultPageSize,
                     quality = preferencesState.value.defaultPdfQuality
                 )
                 refreshStorageMetrics()
                 if (updated != null) {
-                    val modeName = if (useEnhanced) "Enhanced" else "Original"
-                    showMessage("Switched '${updated.title}' to $modeName scan layer.")
+                    showMessage("Switched '${updated.title}' to ${filterMode.label}.")
                     onCompleted(updated)
                 }
             } finally {
@@ -394,19 +435,22 @@ class PaperworkViewModel(
     }
 
     fun shareDocument(context: Context, document: PaperworkDocument) {
+        if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+            showMessage("Cannot share unreadable document encrypted with invalidated key v${document.keyVersion}.")
+            return
+        }
         viewModelScope.launch {
             try {
-                val tempFile = withContext(Dispatchers.IO) {
-                    cryptoManager.materializeDecryptedTempFile(
-                        sourceEncryptedFile = File(document.encryptedPdfPath),
-                        tempFileName = document.fileName.ifBlank { "${document.title}.pdf" },
-                        aad = document.id
-                    )
+                val session = withContext(Dispatchers.IO) {
+                    repo.secureDocumentAccessManager.openDecryptedSession(
+                        document = document,
+                        purpose = "share"
+                    ).getOrThrow()
                 }
                 val uri = FileProvider.getUriForFile(
                     context,
                     "${context.packageName}.fileprovider",
-                    tempFile
+                    session.decryptedFile
                 )
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
                     type = "application/pdf"
@@ -459,10 +503,17 @@ class PaperworkViewModel(
     fun startNewScanSession() {
         val prefs = preferencesState.value
         val timestamp = SimpleDateFormat("MMM d, HHmm", Locale.getDefault()).format(Date())
+        val defaultFilter = if (prefs.defaultEnhancedScan) {
+            ScanFilterMode.ENHANCED_COLOR
+        } else {
+            ScanFilterMode.ORIGINAL
+        }
         _scannerState.value = ScannerStudioState(
             pages = emptyList(),
             selectedPageIndex = 0,
             showEnhancedPreview = prefs.defaultEnhancedScan,
+            activeFilterMode = defaultFilter,
+            isRetakingCurrentPage = false,
             documentTitle = "Scan $timestamp",
             selectedQuality = prefs.defaultPdfQuality,
             selectedPageSize = prefs.defaultPageSize,
@@ -471,15 +522,29 @@ class PaperworkViewModel(
         )
     }
 
+    fun prepareSinglePageRetake() {
+        _scannerState.update { it.copy(isRetakingCurrentPage = true) }
+    }
+
+    fun cancelSinglePageRetake() {
+        _scannerState.update { it.copy(isRetakingCurrentPage = false) }
+    }
+
     fun appendScannedUris(uris: List<Uri>, onReady: () -> Unit = {}) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
             _isBusy.value = true
             try {
+                val filterMode = _scannerState.value.activeFilterMode
+                val targetEnhFilter = if (filterMode == ScanFilterMode.ORIGINAL) {
+                    ScanFilterMode.ENHANCED_COLOR
+                } else {
+                    filterMode
+                }
                 val newPages = withContext(Dispatchers.IO) {
                     uris.mapNotNull { uri ->
-                        decodeSampledBitmapFromUri(uri, 2000)?.let { orig ->
-                            val enh = pdfEngine.createEnhancedDocumentBitmap(orig)
+                        SafeBitmapDecoder.decodeUriSafely(appContext, uri, 2200)?.let { orig ->
+                            val enh = pdfEngine.createEnhancedDocumentBitmap(orig, targetEnhFilter)
                             StagedScanPage(
                                 originalBitmap = orig,
                                 enhancedBitmap = enh
@@ -493,14 +558,27 @@ class PaperworkViewModel(
                             val ts = SimpleDateFormat("MMM d, HHmm", Locale.getDefault()).format(Date())
                             "Scan $ts"
                         }
-                        val combined = state.pages + newPages
-                        state.copy(
-                            pages = combined,
-                            selectedPageIndex = combined.lastIndex.coerceAtLeast(0),
-                            documentTitle = baseTitle
-                        )
+                        if (state.isRetakingCurrentPage && state.selectedPageIndex in state.pages.indices) {
+                            val mutable = state.pages.toMutableList()
+                            mutable[state.selectedPageIndex] = newPages.first()
+                            state.copy(
+                                pages = mutable,
+                                isRetakingCurrentPage = false,
+                                documentTitle = baseTitle
+                            )
+                        } else {
+                            val combined = state.pages + newPages
+                            state.copy(
+                                pages = combined,
+                                selectedPageIndex = combined.lastIndex.coerceAtLeast(0),
+                                isRetakingCurrentPage = false,
+                                documentTitle = baseTitle
+                            )
+                        }
                     }
                     onReady()
+                } else {
+                    showMessage("Could not decode image from selection.")
                 }
             } finally {
                 _isBusy.value = false
@@ -512,8 +590,14 @@ class PaperworkViewModel(
         viewModelScope.launch {
             _isBusy.value = true
             try {
+                val filterMode = _scannerState.value.activeFilterMode
+                val targetEnhFilter = if (filterMode == ScanFilterMode.ORIGINAL) {
+                    ScanFilterMode.ENHANCED_COLOR
+                } else {
+                    filterMode
+                }
                 val page = withContext(Dispatchers.Default) {
-                    val enh = pdfEngine.createEnhancedDocumentBitmap(bitmap)
+                    val enh = pdfEngine.createEnhancedDocumentBitmap(bitmap, targetEnhFilter)
                     StagedScanPage(
                         originalBitmap = bitmap,
                         enhancedBitmap = enh
@@ -524,12 +608,23 @@ class PaperworkViewModel(
                         val ts = SimpleDateFormat("MMM d, HHmm", Locale.getDefault()).format(Date())
                         "Scan $ts"
                     }
-                    val combined = state.pages + page
-                    state.copy(
-                        pages = combined,
-                        selectedPageIndex = combined.lastIndex.coerceAtLeast(0),
-                        documentTitle = baseTitle
-                    )
+                    if (state.isRetakingCurrentPage && state.selectedPageIndex in state.pages.indices) {
+                        val mutable = state.pages.toMutableList()
+                        mutable[state.selectedPageIndex] = page
+                        state.copy(
+                            pages = mutable,
+                            isRetakingCurrentPage = false,
+                            documentTitle = baseTitle
+                        )
+                    } else {
+                        val combined = state.pages + page
+                        state.copy(
+                            pages = combined,
+                            selectedPageIndex = combined.lastIndex.coerceAtLeast(0),
+                            isRetakingCurrentPage = false,
+                            documentTitle = baseTitle
+                        )
+                    }
                 }
                 onReady()
             } finally {
@@ -544,8 +639,38 @@ class PaperworkViewModel(
         }
     }
 
-    fun setScannerEnhancedMode(showEnhanced: Boolean) {
-        _scannerState.update { it.copy(showEnhancedPreview = showEnhanced) }
+    fun setScannerFilterMode(mode: ScanFilterMode) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val state = _scannerState.value
+            val updatedPages = if (mode == ScanFilterMode.ORIGINAL) {
+                state.pages
+            } else {
+                state.pages.map { page ->
+                    val croppedOrig = pdfEngine.cropBitmapNormalized(
+                        page.originalBitmap,
+                        page.cropNormalized[0],
+                        page.cropNormalized[1],
+                        page.cropNormalized[2],
+                        page.cropNormalized[3]
+                    )
+                    val deskewed = pdfEngine.applyPerspectiveAndDeskew(
+                        croppedOrig,
+                        NormalizedQuadCorners(),
+                        page.deskewAngleDegrees
+                    )
+                    page.copy(
+                        enhancedBitmap = pdfEngine.createEnhancedDocumentBitmap(deskewed, mode)
+                    )
+                }
+            }
+            _scannerState.update {
+                it.copy(
+                    pages = updatedPages,
+                    showEnhancedPreview = mode != ScanFilterMode.ORIGINAL,
+                    activeFilterMode = mode
+                )
+            }
+        }
     }
 
     fun rotateCurrentScannerPage() {
@@ -559,26 +684,56 @@ class PaperworkViewModel(
         }
     }
 
-    fun cropCurrentScannerPage(leftRatio: Float, topRatio: Float, rightRatio: Float, bottomRatio: Float) {
+    fun cropAndDeskewCurrentScannerPage(
+        leftRatio: Float,
+        topRatio: Float,
+        rightRatio: Float,
+        bottomRatio: Float,
+        deskewAngleDegrees: Float = 0f
+    ) {
         viewModelScope.launch(Dispatchers.Default) {
             val state = _scannerState.value
             val idx = state.selectedPageIndex
             if (idx !in state.pages.indices) return@launch
             val page = state.pages[idx]
-            // Crop from the untouched original bitmap so cropping is always lossless, then re-generate enhanced
-            val croppedEnhanced = pdfEngine.createEnhancedDocumentBitmap(
-                pdfEngine.cropBitmapNormalized(page.originalBitmap, leftRatio, topRatio, rightRatio, bottomRatio)
+            val filterToApply = if (state.activeFilterMode == ScanFilterMode.ORIGINAL) {
+                ScanFilterMode.ENHANCED_COLOR
+            } else {
+                state.activeFilterMode
+            }
+
+            // Apply 4-corner perspective correction and deskew from the untouched original bitmap
+            val quad = NormalizedQuadCorners(
+                topLeft = PointF(leftRatio, topRatio),
+                topRight = PointF(rightRatio, topRatio),
+                bottomRight = PointF(rightRatio, bottomRatio),
+                bottomLeft = PointF(leftRatio, bottomRatio)
             )
+            val perspectiveCorrected = pdfEngine.applyPerspectiveAndDeskew(
+                source = page.originalBitmap,
+                quad = quad,
+                deskewAngleDegrees = deskewAngleDegrees
+            )
+            val cropped = pdfEngine.cropBitmapNormalized(
+                perspectiveCorrected,
+                leftRatio,
+                topRatio,
+                rightRatio,
+                bottomRatio
+            )
+            val enhanced = pdfEngine.createEnhancedDocumentBitmap(cropped, filterToApply)
+
             _scannerState.update { current ->
                 if (idx !in current.pages.indices) return@update current
                 val mutable = current.pages.toMutableList()
                 mutable[idx] = page.copy(
-                    enhancedBitmap = croppedEnhanced,
-                    cropNormalized = floatArrayOf(leftRatio, topRatio, rightRatio, bottomRatio)
+                    enhancedBitmap = enhanced,
+                    cropNormalized = floatArrayOf(leftRatio, topRatio, rightRatio, bottomRatio),
+                    deskewAngleDegrees = deskewAngleDegrees
                 )
                 current.copy(pages = mutable)
             }
-            showMessage("Applied perspective crop while preserving untouched original capture.")
+            showMessage("Applied 4-corner perspective & deskew while preserving untouched original capture.")
         }
     }
 
@@ -636,11 +791,12 @@ class PaperworkViewModel(
                     pageSize = state.selectedPageSize,
                     orientation = state.selectedOrientation,
                     margin = state.selectedMargin,
-                    quality = state.selectedQuality
+                    quality = state.selectedQuality,
+                    filterMode = state.activeFilterMode
                 )
                 refreshStorageMetrics()
                 _scannerState.update { ScannerStudioState() }
-                showMessage("Saved '${doc.title}' (${doc.pageCount} pages) with Original & Enhanced layers.")
+                showMessage("Saved '${doc.title}' (${doc.pageCount} pages) with Original & ${state.activeFilterMode.label} layers.")
                 onSaved(doc)
             } catch (e: Exception) {
                 showMessage("Failed to save scan: ${e.message}")
@@ -649,7 +805,7 @@ class PaperworkViewModel(
         }
     }
 
-    // ─── Image-to-PDF Conversion Studio ──────────────────────────────────────
+    // ─── Image-to-PDF Conversion Studio (OOM-Safe + Cancellable) ─────────────
 
     fun appendConversionImages(uris: List<Uri>, onAdded: () -> Unit = {}) {
         if (uris.isEmpty()) return
@@ -658,10 +814,13 @@ class PaperworkViewModel(
             try {
                 val decoded = withContext(Dispatchers.IO) {
                     uris.mapNotNull { uri ->
-                        decodeSampledBitmapFromUri(uri, 2000)?.let { bmp ->
+                        SafeBitmapDecoder.decodeUriSafely(appContext, uri, 2200)?.let { bmp ->
                             StagedScanPage(
                                 originalBitmap = bmp,
-                                enhancedBitmap = pdfEngine.createEnhancedDocumentBitmap(bmp)
+                                enhancedBitmap = pdfEngine.createEnhancedDocumentBitmap(
+                                    bmp,
+                                    ScanFilterMode.ENHANCED_COLOR
+                                )
                             )
                         }
                     }
@@ -681,6 +840,8 @@ class PaperworkViewModel(
                         )
                     }
                     onAdded()
+                } else {
+                    showMessage("Unable to decode selected image(s).")
                 }
             } finally {
                 _isBusy.value = false
@@ -735,10 +896,17 @@ class PaperworkViewModel(
         }
     }
 
+    fun cancelConversionJob() {
+        activeConversionJob?.cancel()
+        activeConversionJob = null
+        _conversionState.update { it.copy(isConverting = false) }
+        showMessage("Cancelled PDF conversion.")
+    }
+
     fun exportConversionToPdf(useEnhancedImages: Boolean, onCreated: (PaperworkDocument) -> Unit) {
         val state = _conversionState.value
         if (state.pages.isEmpty() || state.isConverting) return
-        viewModelScope.launch {
+        activeConversionJob = viewModelScope.launch {
             _conversionState.update { it.copy(isConverting = true) }
             try {
                 val specs = state.pages.map { page ->
@@ -759,6 +927,8 @@ class PaperworkViewModel(
                 _conversionState.value = ConversionStudioState()
                 showMessage("Created PDF '${doc.title}' (${doc.pageCount} pages).")
                 onCreated(doc)
+            } catch (_: CancellationException) {
+                _conversionState.update { it.copy(isConverting = false) }
             } catch (e: Exception) {
                 showMessage("PDF creation failed: ${e.message}")
                 _conversionState.update { it.copy(isConverting = false) }
@@ -767,8 +937,8 @@ class PaperworkViewModel(
     }
 
     /**
-     * Losslessly rotates or extracts/reorders pages of an existing PDF using Apache `pdfbox-android`
-     * without rasterizing vector text or graphics.
+     * Non-rasterizing page manipulation using Apache `pdfbox-android`
+     * with post-write integrity validation via `PdfIntegrityValidator`.
      */
     fun createModifiedPdfCopyWithPdfBox(
         sourceDocument: PaperworkDocument,
@@ -778,23 +948,26 @@ class PaperworkViewModel(
         rotationDegrees: Int,
         onCreated: (PaperworkDocument) -> Unit
     ) {
+        if (sourceDocument.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+            showMessage("Cannot modify unreadable document encrypted with invalidated key.")
+            return
+        }
         viewModelScope.launch {
             _isBusy.value = true
             try {
                 val created = withContext(Dispatchers.IO) {
-                    val srcTemp = cryptoManager.materializeDecryptedTempFile(
-                        sourceEncryptedFile = File(sourceDocument.encryptedPdfPath),
-                        tempFileName = "mod_src_${sourceDocument.id}.pdf",
-                        aad = sourceDocument.id
-                    )
+                    val srcSession = repo.secureDocumentAccessManager.openDecryptedSession(
+                        document = sourceDocument,
+                        purpose = "pdfbox_mod"
+                    ).getOrThrow()
                     val outTemp = File(
                         File(appContext.cacheDir, "active_session_tmp").apply { mkdirs() },
-                        "mod_out_${sourceDocument.id}.pdf"
+                        "mod_out_${sourceDocument.id}_${System.nanoTime()}.pdf"
                     )
                     try {
                         val range = pdfEngine.parsePageRange(pageRangeText, sourceDocument.pageCount)
                         pdfEngine.createReorderedOrFilteredPdf(
-                            sourcePdfFile = srcTemp,
+                            sourcePdfFile = srcSession.decryptedFile,
                             targetPdfFile = outTemp,
                             reverseOrder = reverseOrder,
                             oneBasedPageNumbers = range,
@@ -806,12 +979,12 @@ class PaperworkViewModel(
                             documentType = sourceDocument.documentType
                         )
                     } finally {
-                        cryptoManager.secureDeleteFile(srcTemp)
-                        cryptoManager.secureDeleteFile(outTemp)
+                        srcSession.close()
+                        cryptoManager.deleteFileSafely(outTemp)
                     }
                 }
                 refreshStorageMetrics()
-                showMessage("Created vector-preserved PDF '${created.title}'.")
+                showMessage("Created validated non-rasterized PDF '${created.title}'.")
                 onCreated(created)
             } catch (e: Exception) {
                 showMessage("Operation failed: ${e.message}")
@@ -828,28 +1001,6 @@ class PaperworkViewModel(
                 if (nameIndex >= 0 && cursor.moveToFirst()) {
                     cursor.getString(nameIndex)
                 } else null
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun decodeSampledBitmapFromUri(uri: Uri, maxDim: Int): Bitmap? {
-        return try {
-            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            appContext.contentResolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, boundsOptions)
-            }
-            var sampleSize = 1
-            while (boundsOptions.outWidth / sampleSize > maxDim || boundsOptions.outHeight / sampleSize > maxDim) {
-                sampleSize *= 2
-            }
-            val decodeOptions = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            appContext.contentResolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, decodeOptions)
             }
         } catch (_: Exception) {
             null

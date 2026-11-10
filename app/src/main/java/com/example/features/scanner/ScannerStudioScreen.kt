@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.Typeface
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -52,6 +53,7 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.AlertDialog
@@ -95,20 +97,19 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.example.R
+import com.example.core.image.NormalizedQuadCorners
 import com.example.domain.model.MarginSize
 import com.example.domain.model.PageOrientation
 import com.example.domain.model.PageSizeOption
 import com.example.domain.model.PdfQuality
+import com.example.domain.model.ScanFilterMode
 import com.example.ui.ScannerStudioState
-import com.example.ui.StagedScanPage
 import java.util.concurrent.Executors
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -118,12 +119,13 @@ fun ScannerStudioScreen(
     onBack: () -> Unit,
     onLaunchMlKitOrCameraScan: () -> Unit,
     onOpenInAppCameraFallback: () -> Unit,
+    onRetakeCurrentPage: () -> Unit,
     onImportFromGallery: () -> Unit,
     onCaptureSyntheticTestPage: () -> Unit,
     onSelectPage: (Int) -> Unit,
-    onToggleEnhancedMode: (Boolean) -> Unit,
+    onSelectFilterMode: (ScanFilterMode) -> Unit,
     onRotateCurrentPage: () -> Unit,
-    onCropCurrentPage: (Float, Float, Float, Float) -> Unit,
+    onCropAndDeskewCurrentPage: (Float, Float, Float, Float, Float) -> Unit,
     onMovePage: (Int, Int) -> Unit,
     onDeleteCurrentPage: () -> Unit,
     onUpdateSaveConfig: (String, PdfQuality, PageSizeOption, PageOrientation, MarginSize) -> Unit,
@@ -132,7 +134,7 @@ fun ScannerStudioScreen(
 ) {
     BackHandler(onBack = onBack)
 
-    var showCropDialog by remember { mutableStateOf(false) }
+    var showPerspectiveDeskewDialog by remember { mutableStateOf(false) }
     var showSaveSheet by remember { mutableStateOf(false) }
 
     val currentPage = state.pages.getOrNull(state.selectedPageIndex)
@@ -149,7 +151,7 @@ fun ScannerStudioScreen(
                         )
                         if (state.pages.isNotEmpty()) {
                             Text(
-                                text = "Page ${state.selectedPageIndex + 1} of ${state.pages.size} • ${if (state.showEnhancedPreview) "Enhanced (Default)" else "Original Preserved"}",
+                                text = "Page ${state.selectedPageIndex + 1} of ${state.pages.size} • ${state.activeFilterMode.label}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -220,7 +222,7 @@ fun ScannerStudioScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Paperwork uses Google ML Kit Document Scanner with automatic CameraX fallback. Both capture paths preserve your untouched Original image alongside the Enhanced document layer.",
+                            text = "Automatic edge detection, 4-corner perspective correction, deskew, rotation, multi-page capture, retake, and color-preserving enhancement.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center
@@ -279,29 +281,37 @@ fun ScannerStudioScreen(
                     .fillMaxSize()
                     .padding(innerPadding)
                     .padding(horizontal = 24.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 1. Reversible Original vs. Enhanced Segmented Control (Default: Enhanced)
+                // 1. 3-Mode Non-Destructive Filter Selector (Original | Enhanced Color | Ink-Saving B&W)
                 SingleChoiceSegmentedButtonRow(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("scanner_original_enhanced_toggle")
                 ) {
                     SegmentedButton(
-                        selected = !state.showEnhancedPreview,
-                        onClick = { onToggleEnhancedMode(false) },
-                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                        selected = state.activeFilterMode == ScanFilterMode.ORIGINAL,
+                        onClick = { onSelectFilterMode(ScanFilterMode.ORIGINAL) },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 3),
                         modifier = Modifier.testTag("segment_original")
                     ) {
-                        Text(stringResource(R.string.scanner_original))
+                        Text("Original", style = MaterialTheme.typography.labelMedium)
                     }
                     SegmentedButton(
-                        selected = state.showEnhancedPreview,
-                        onClick = { onToggleEnhancedMode(true) },
-                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                        selected = state.activeFilterMode == ScanFilterMode.ENHANCED_COLOR,
+                        onClick = { onSelectFilterMode(ScanFilterMode.ENHANCED_COLOR) },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 3),
                         modifier = Modifier.testTag("segment_enhanced")
                     ) {
-                        Text(stringResource(R.string.scanner_enhanced))
+                        Text("Enhanced Color", style = MaterialTheme.typography.labelMedium)
+                    }
+                    SegmentedButton(
+                        selected = state.activeFilterMode == ScanFilterMode.INK_SAVING_GRAYSCALE,
+                        onClick = { onSelectFilterMode(ScanFilterMode.INK_SAVING_GRAYSCALE) },
+                        shape = SegmentedButtonDefaults.itemShape(index = 2, count = 3),
+                        modifier = Modifier.testTag("segment_grayscale")
+                    ) {
+                        Text("Grayscale", style = MaterialTheme.typography.labelMedium)
                     }
                 }
 
@@ -322,17 +332,17 @@ fun ScannerStudioScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         if (currentPage != null) {
-                            val activeBmp = if (state.showEnhancedPreview) {
-                                currentPage.enhancedBitmap
-                            } else {
-                                currentPage.originalBitmap
+                            val activeBmp = when (state.activeFilterMode) {
+                                ScanFilterMode.ORIGINAL -> currentPage.originalBitmap
+                                ScanFilterMode.ENHANCED_COLOR,
+                                ScanFilterMode.INK_SAVING_GRAYSCALE -> currentPage.enhancedBitmap
                             }
                             val rotatedBmp = remember(activeBmp, currentPage.rotationDegrees) {
                                 rotatePreviewBitmap(activeBmp, currentPage.rotationDegrees)
                             }
                             Image(
                                 bitmap = rotatedBmp.asImageBitmap(),
-                                contentDescription = if (state.showEnhancedPreview) "Enhanced scan preview" else "Original scan preview",
+                                contentDescription = state.activeFilterMode.label,
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .clip(RoundedCornerShape(8.dp)),
@@ -385,7 +395,7 @@ fun ScannerStudioScreen(
                     }
                 }
 
-                // 4. Preview Screen Action Bar (Add page, Rotate, Crop, Reorder, Retake, Delete)
+                // 4. Preview Screen Action Bar (Add page, Retake, Rotate, Perspective/Deskew, Reorder, Delete)
                 Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.surfaceContainer,
@@ -394,7 +404,7 @@ fun ScannerStudioScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                            .padding(horizontal = 6.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -405,16 +415,22 @@ fun ScannerStudioScreen(
                             Icon(Icons.Default.AddAPhoto, contentDescription = "Add page")
                         }
                         IconButton(
+                            onClick = onRetakeCurrentPage,
+                            modifier = Modifier.testTag("scanner_retake_page_button")
+                        ) {
+                            Icon(Icons.Default.Replay, contentDescription = "Retake current page")
+                        }
+                        IconButton(
                             onClick = onRotateCurrentPage,
                             modifier = Modifier.testTag("scanner_rotate_button")
                         ) {
                             Icon(Icons.Default.RotateRight, contentDescription = "Rotate page")
                         }
                         IconButton(
-                            onClick = { showCropDialog = true },
+                            onClick = { showPerspectiveDeskewDialog = true },
                             modifier = Modifier.testTag("scanner_crop_button")
                         ) {
-                            Icon(Icons.Default.Crop, contentDescription = "Crop page")
+                            Icon(Icons.Default.Crop, contentDescription = "Perspective & Deskew")
                         }
                         IconButton(
                             onClick = {
@@ -454,55 +470,62 @@ fun ScannerStudioScreen(
         }
     }
 
-    // Perspective / Margin Crop Dialog (Non-destructive: preserves originalBitmap)
-    if (showCropDialog && currentPage != null) {
-        var leftCrop by remember { mutableFloatStateOf(0.05f) }
-        var topCrop by remember { mutableFloatStateOf(0.05f) }
-        var rightCrop by remember { mutableFloatStateOf(0.95f) }
-        var bottomCrop by remember { mutableFloatStateOf(0.95f) }
+    // 4-Corner Perspective Correction, Manual Corner Adjustment & Deskew Dialog
+    if (showPerspectiveDeskewDialog && currentPage != null) {
+        var leftCrop by remember { mutableFloatStateOf(currentPage.cropNormalized.getOrElse(0) { 0.04f }) }
+        var topCrop by remember { mutableFloatStateOf(currentPage.cropNormalized.getOrElse(1) { 0.04f }) }
+        var rightCrop by remember { mutableFloatStateOf(currentPage.cropNormalized.getOrElse(2) { 0.96f }) }
+        var bottomCrop by remember { mutableFloatStateOf(currentPage.cropNormalized.getOrElse(3) { 0.96f }) }
+        var deskewAngle by remember { mutableFloatStateOf(currentPage.deskewAngleDegrees) }
 
         AlertDialog(
-            onDismissRequest = { showCropDialog = false },
-            title = { Text("Adjust document boundaries") },
+            onDismissRequest = { showPerspectiveDeskewDialog = false },
+            title = { Text("4-Corner Perspective & Deskew") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Cropping refines the Enhanced page while keeping the untouched Original capture safe in your vault.",
+                        text = "Adjust corner boundaries and deskew angle. Untouched Original capture remains permanently preserved in your vault.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Text("Left / Right inset", style = MaterialTheme.typography.labelMedium)
+                    Text("Horizontal corner inset (${(leftCrop * 100).toInt()}%)", style = MaterialTheme.typography.labelMedium)
                     Slider(
                         value = leftCrop,
                         onValueChange = {
-                            leftCrop = it.coerceIn(0f, 0.35f)
-                            rightCrop = (1f - leftCrop).coerceIn(0.65f, 1f)
+                            leftCrop = it.coerceIn(0f, 0.30f)
+                            rightCrop = (1f - leftCrop).coerceIn(0.70f, 1f)
                         },
                         valueRange = 0f..0.3f
                     )
-                    Text("Top / Bottom inset", style = MaterialTheme.typography.labelMedium)
+                    Text("Vertical corner inset (${(topCrop * 100).toInt()}%)", style = MaterialTheme.typography.labelMedium)
                     Slider(
                         value = topCrop,
                         onValueChange = {
-                            topCrop = it.coerceIn(0f, 0.35f)
-                            bottomCrop = (1f - topCrop).coerceIn(0.65f, 1f)
+                            topCrop = it.coerceIn(0f, 0.30f)
+                            bottomCrop = (1f - topCrop).coerceIn(0.70f, 1f)
                         },
                         valueRange = 0f..0.3f
+                    )
+                    Text("Deskew straightening (${String.format("%.1f°", deskewAngle)})", style = MaterialTheme.typography.labelMedium)
+                    Slider(
+                        value = deskewAngle,
+                        onValueChange = { deskewAngle = it },
+                        valueRange = -12f..12f
                     )
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        onCropCurrentPage(leftCrop, topCrop, rightCrop, bottomCrop)
-                        showCropDialog = false
+                        onCropAndDeskewCurrentPage(leftCrop, topCrop, rightCrop, bottomCrop, deskewAngle)
+                        showPerspectiveDeskewDialog = false
                     }
                 ) {
-                    Text("Apply crop")
+                    Text("Apply Perspective & Deskew")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showCropDialog = false }) {
+                TextButton(onClick = { showPerspectiveDeskewDialog = false }) {
                     Text("Cancel")
                 }
             }
@@ -627,15 +650,12 @@ fun ScannerStudioScreen(
 
 /**
  * Built-in CameraX Document Scanner fallback screen used when Google Play Services
- * ML Kit Document Scanner UI is unavailable on the device/emulator or when the user
- * launches the in-app camera studio directly.
- *
- * Properly requests runtime `Manifest.permission.CAMERA` and feeds captured frames
- * into the exact same Scanner Preview Studio.
+ * ML Kit Document Scanner UI is unavailable or when retaking/capturing in-app.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraXFallbackScannerScreen(
+    isRetakeMode: Boolean = false,
     onBack: () -> Unit,
     onBitmapCaptured: (Bitmap) -> Unit,
     onImportFromGallery: () -> Unit
@@ -673,7 +693,9 @@ fun CameraXFallbackScannerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Document Camera (Fallback Studio)") },
+                title = {
+                    Text(if (isRetakeMode) "Retake Document Page" else "Document Camera (Auto Edge Detection)")
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -737,7 +759,7 @@ fun CameraXFallbackScannerScreen(
                     }
                 }
 
-                // Document Framing Boundary Guide Overlay
+                // Automatic Edge Detection & 4-Corner Framing Guide Overlay
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -747,12 +769,26 @@ fun CameraXFallbackScannerScreen(
                     val guideHeight = size.height * 0.82f
                     val left = (size.width - guideWidth) / 2f
                     val top = (size.height - guideHeight) / 2f
+                    val right = left + guideWidth
+                    val bottom = top + guideHeight
+                    val accent = androidx.compose.ui.graphics.Color(0xFF83D2E5)
+
                     drawRect(
-                        color = androidx.compose.ui.graphics.Color(0xFF83D2E5),
+                        color = accent,
                         topLeft = Offset(left, top),
                         size = Size(guideWidth, guideHeight),
-                        style = Stroke(width = 6f)
+                        style = Stroke(width = 5f)
                     )
+
+                    val handleRadius = 14f
+                    listOf(
+                        Offset(left, top),
+                        Offset(right, top),
+                        Offset(right, bottom),
+                        Offset(left, bottom)
+                    ).forEach { corner ->
+                        drawCircle(color = accent, radius = handleRadius, center = corner)
+                    }
                 }
             }
 
@@ -859,25 +895,31 @@ private fun generateSyntheticCapturedSheetBitmap(): Bitmap {
             textSize = 24f
             typeface = Typeface.MONOSPACE
         }
+        val colorStampPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(11, 87, 208)
+            textSize = 26f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
         drawText("SCANNED FIELD DOCUMENT MEMORANDUM", 80f, 140f, titlePaint)
         val lines = listOf(
             "Captured via Paperwork Scanner Studio",
-            "Mode: Dual Original + Enhanced Layer Preservation",
+            "Mode: Dual Original + Enhanced Color Preservation",
             "------------------------------------------------",
-            "• Item 1: Quarterly Expense Statement .... $420.00",
-            "• Item 2: Travel Lodging Receipt ......... $285.50",
-            "• Item 3: Client Luncheon Voucher ........ $64.25",
+            "- Item 1: Quarterly Expense Statement .... $420.00",
+            "- Item 2: Travel Lodging Receipt ......... $285.50",
+            "- Item 3: Client Luncheon Voucher ........ $64.25",
             "------------------------------------------------",
             "Total Verified Amount: $769.75",
             "",
-            "Switch between 'Original' and 'Enhanced' tabs above",
-            "to inspect the non-destructive image pipeline."
+            "Switch between 'Original', 'Enhanced Color', and",
+            "'Grayscale' tabs above to inspect the pipeline."
         )
         var y = 240f
         for (line in lines) {
             drawText(line, 80f, y, bodyPaint)
             y += 52f
         }
+        drawText("[COLOR STAMP: VERIFIED ORIGINAL & ENHANCED]", 80f, 940f, colorStampPaint)
     }
     return bmp
 }

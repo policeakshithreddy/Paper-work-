@@ -28,12 +28,12 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Scanner
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -57,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.repository.DocumentRepository
+import com.example.domain.model.DocumentEncryptionStatus
 import com.example.domain.model.DocumentType
 import com.example.domain.model.PaperworkDocument
 import java.text.SimpleDateFormat
@@ -104,13 +105,18 @@ fun DocumentThumbnailView(
             )
         } else {
             Icon(
-                imageVector = when (document.documentType) {
-                    DocumentType.SCANNED -> Icons.Default.Scanner
-                    DocumentType.CONVERTED -> Icons.Default.Description
-                    DocumentType.PDF -> Icons.Default.PictureAsPdf
+                imageVector = when {
+                    document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED -> Icons.Default.Warning
+                    document.documentType == DocumentType.SCANNED -> Icons.Default.Scanner
+                    document.documentType == DocumentType.CONVERTED -> Icons.Default.Description
+                    else -> Icons.Default.PictureAsPdf
                 },
                 contentDescription = document.documentType.label,
-                tint = MaterialTheme.colorScheme.primary,
+                tint = if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
                 modifier = Modifier.size(28.dp)
             )
         }
@@ -131,6 +137,7 @@ fun DocumentListItemCard(
     modifier: Modifier = Modifier
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val isUnreadable = document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED
 
     Card(
         modifier = modifier
@@ -140,7 +147,11 @@ fun DocumentListItemCard(
             .testTag("document_card_${document.id}"),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+            containerColor = if (isUnreadable) {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.45f)
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerLow
+            }
         )
     ) {
         Row(
@@ -176,20 +187,24 @@ fun DocumentListItemCard(
                 ) {
                     Surface(
                         shape = RoundedCornerShape(6.dp),
-                        color = when (document.documentType) {
-                            DocumentType.SCANNED -> MaterialTheme.colorScheme.tertiaryContainer
+                        color = when {
+                            isUnreadable -> MaterialTheme.colorScheme.errorContainer
+                            document.documentType == DocumentType.SCANNED -> MaterialTheme.colorScheme.tertiaryContainer
                             else -> MaterialTheme.colorScheme.secondaryContainer
                         }
                     ) {
                         Text(
-                            text = if (document.documentType == DocumentType.SCANNED) {
-                                if (document.currentlyUsingEnhanced) "Scan • Enhanced" else "Scan • Original"
-                            } else {
-                                document.documentType.label
+                            text = when {
+                                isUnreadable -> "Key v${document.keyVersion} Invalidated"
+                                document.documentType == DocumentType.SCANNED -> {
+                                    if (document.currentlyUsingEnhanced) "Scan • Enhanced" else "Scan • Original"
+                                }
+                                else -> document.documentType.label
                             },
                             style = MaterialTheme.typography.labelSmall,
-                            color = when (document.documentType) {
-                                DocumentType.SCANNED -> MaterialTheme.colorScheme.onTertiaryContainer
+                            color = when {
+                                isUnreadable -> MaterialTheme.colorScheme.onErrorContainer
+                                document.documentType == DocumentType.SCANNED -> MaterialTheme.colorScheme.onTertiaryContainer
                                 else -> MaterialTheme.colorScheme.onSecondaryContainer
                             },
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -207,14 +222,14 @@ fun DocumentListItemCard(
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        imageVector = Icons.Default.Lock,
+                        imageVector = if (isUnreadable) Icons.Default.Warning else Icons.Default.Lock,
                         contentDescription = "AES-256-GCM Encrypted",
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = if (isUnreadable) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(13.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "Modified ${formatRelativeDate(document.modifiedAt)}",
+                        text = "Key v${document.keyVersion} • ${formatRelativeDate(document.modifiedAt)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -238,62 +253,64 @@ fun DocumentListItemCard(
                     expanded = menuExpanded,
                     onDismissRequest = { menuExpanded = false }
                 ) {
-                    DropdownMenuItem(
-                        text = { Text("Open viewer") },
-                        leadingIcon = { Icon(Icons.Default.PictureAsPdf, contentDescription = null) },
-                        onClick = {
-                            menuExpanded = false
-                            onOpen()
-                        }
-                    )
-                    if (document.scanPages.isNotEmpty() && onToggleOriginalEnhanced != null) {
-                        val targetMode = !document.currentlyUsingEnhanced
+                    if (!isUnreadable) {
                         DropdownMenuItem(
-                            text = {
-                                Text(
-                                    if (targetMode) "Switch to Enhanced scan"
-                                    else "Switch to Original scan"
-                                )
-                            },
-                            leadingIcon = { Icon(Icons.Default.AutoFixHigh, contentDescription = null) },
+                            text = { Text("Open viewer") },
+                            leadingIcon = { Icon(Icons.Default.PictureAsPdf, contentDescription = null) },
                             onClick = {
                                 menuExpanded = false
-                                onToggleOriginalEnhanced(targetMode)
+                                onOpen()
+                            }
+                        )
+                        if (document.scanPages.isNotEmpty() && onToggleOriginalEnhanced != null) {
+                            val targetMode = !document.currentlyUsingEnhanced
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (targetMode) "Switch to Enhanced scan"
+                                        else "Switch to Original scan"
+                                    )
+                                },
+                                leadingIcon = { Icon(Icons.Default.AutoFixHigh, contentDescription = null) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onToggleOriginalEnhanced(targetMode)
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Print / Reverse print") },
+                            leadingIcon = { Icon(Icons.Default.Print, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                onPrint()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Rename") },
+                            leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                onRename()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Duplicate") },
+                            leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                onDuplicate()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Share PDF") },
+                            leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                            onClick = {
+                                menuExpanded = false
+                                onShare()
                             }
                         )
                     }
-                    DropdownMenuItem(
-                        text = { Text("Print / Reverse print") },
-                        leadingIcon = { Icon(Icons.Default.Print, contentDescription = null) },
-                        onClick = {
-                            menuExpanded = false
-                            onPrint()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Rename") },
-                        leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, contentDescription = null) },
-                        onClick = {
-                            menuExpanded = false
-                            onRename()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Duplicate") },
-                        leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) },
-                        onClick = {
-                            menuExpanded = false
-                            onDuplicate()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Share PDF") },
-                        leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
-                        onClick = {
-                            menuExpanded = false
-                            onShare()
-                        }
-                    )
                     DropdownMenuItem(
                         text = {
                             Text(
@@ -381,7 +398,7 @@ fun DeleteDocumentConfirmDialog(
         title = { Text("Delete '${document.title}'?") },
         text = {
             Text(
-                text = "This will securely overwrite and permanently delete the encrypted PDF, thumbnail, and any preserved Original/Enhanced scan layers from your device.",
+                text = "This will remove the encrypted PDF, thumbnail, Room database record, and any preserved Original/Enhanced scan layers from your vault.",
                 style = MaterialTheme.typography.bodyMedium
             )
         },

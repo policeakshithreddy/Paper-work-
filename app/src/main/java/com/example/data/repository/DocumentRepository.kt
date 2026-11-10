@@ -7,16 +7,19 @@ import android.net.Uri
 import android.util.LruCache
 import com.example.core.pdf.PageImageSpec
 import com.example.core.pdf.PdfProcessingEngine
+import com.example.core.pdf.SecureDocumentAccessManager
 import com.example.core.security.VaultCryptoManager
 import com.example.data.local.DocumentDao
 import com.example.data.local.DocumentEntity
 import com.example.data.local.SensitiveDocumentMetadata
+import com.example.domain.model.DocumentEncryptionStatus
 import com.example.domain.model.DocumentType
 import com.example.domain.model.MarginSize
 import com.example.domain.model.PageOrientation
 import com.example.domain.model.PageSizeOption
 import com.example.domain.model.PaperworkDocument
 import com.example.domain.model.PdfQuality
+import com.example.domain.model.ScanFilterMode
 import com.example.domain.model.ScanPageRecord
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -30,19 +33,24 @@ import java.util.UUID
  * Local-only privacy-first repository managing Paperwork's encrypted document vault.
  *
  * Security Guarantees:
- * - Every PDF file is stored AES-256-GCM encrypted in `/files/vault_pdfs/{id}.pdf.enc`.
+ * - Every PDF file is stored AES-256-GCM encrypted in `/files/vault_pdfs/{id}.pdf.enc`
+ *   with the 19-byte `PWKV` versioned binary header and a unique 12-byte random IV.
  * - Every scan page preserves BOTH its untouched original image (`/files/vault_scans/{pageId}_orig.jpg.enc`)
  *   and its enhanced image (`/files/vault_scans/{pageId}_enh.jpg.enc`) permanently until deleted.
  * - Every thumbnail is stored AES-256-GCM encrypted in `/files/vault_thumbs/{id}.jpg.enc` and
  *   cached only in an in-memory [LruCache] during the active session.
- * - Sensitive metadata (`title`, `fileName`, `extractedOcrText`, `scanPages`) is encrypted inside
- *   `DocumentEntity.encryptedMetadataBlob` with `entity.id` bound as GCM AAD.
+ * - Sensitive metadata (`title`, `fileName`, `nativePdfText`, `ocrRecognizedText`, `scanPages`)
+ *   is encrypted inside `DocumentEntity.encryptedMetadataBlob` with `entity.id` bound as GCM AAD.
+ * - If a previous Keystore key version (`v{N}`) was invalidated, documents encrypted with `v{N}`
+ *   are honestly surfaced with [DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED] rather than
+ *   silently failing or falsely claiming recovery.
  */
 class DocumentRepository(
     private val context: Context,
     private val documentDao: DocumentDao,
     val cryptoManager: VaultCryptoManager,
-    val pdfEngine: PdfProcessingEngine
+    val pdfEngine: PdfProcessingEngine,
+    val secureDocumentAccessManager: SecureDocumentAccessManager = SecureDocumentAccessManager(context, cryptoManager)
 ) {
 
     private val vaultPdfDir = File(context.filesDir, "vault_pdfs").apply { mkdirs() }
@@ -54,10 +62,13 @@ class DocumentRepository(
     }
 
     val allDocumentsFlow: Flow<List<PaperworkDocument>> = documentDao.observeAllDocuments().map { entities ->
-        entities.mapNotNull { entity -> decryptEntityToDomain(entity) }
+        entities.map { entity -> decryptEntityOrSurfaceUnreadable(entity) }
     }
 
-    private fun decryptEntityToDomain(entity: DocumentEntity): PaperworkDocument? {
+    private fun decryptEntityOrSurfaceUnreadable(entity: DocumentEntity): PaperworkDocument {
+        val header = cryptoManager.inspectPayloadHeader(entity.encryptedMetadataBlob)
+        val keyVer = header?.keyVersion ?: entity.keyVersion
+
         return try {
             val decryptedMetaBytes = cryptoManager.decryptBytes(
                 encryptedPayload = entity.encryptedMetadataBlob,
@@ -78,24 +89,55 @@ class DocumentRepository(
                 modifiedAt = entity.modifiedAt,
                 lastOpenedPage = entity.lastOpenedPage,
                 hasNativeTextLayer = entity.hasNativeTextLayer,
-                extractedOcrText = meta.extractedOcrText,
+                nativePdfText = meta.nativePdfText,
+                ocrRecognizedText = meta.ocrRecognizedText,
                 scanPages = meta.scanPages,
-                currentlyUsingEnhanced = entity.currentlyUsingEnhanced
+                currentlyUsingEnhanced = entity.currentlyUsingEnhanced,
+                activeScanFilterMode = meta.activeScanFilterMode,
+                keyVersion = keyVer,
+                encryptionStatus = DocumentEncryptionStatus.ACTIVE_READABLE,
+                hasDigitalSignatures = meta.hasDigitalSignatures
             )
         } catch (_: Exception) {
-            null
+            // Honestly surface unreadable v{N} records when their Keystore key was invalidated
+            PaperworkDocument(
+                id = entity.id,
+                title = "Unreadable Document (Key v$keyVer Invalidated)",
+                fileName = "unreadable_v${keyVer}_${entity.id.take(6)}.pdf",
+                encryptedPdfPath = entity.encryptedPdfPath,
+                encryptedThumbnailPath = entity.encryptedThumbnailPath,
+                fileSize = entity.fileSize,
+                pageCount = entity.pageCount,
+                documentType = runCatching { DocumentType.valueOf(entity.documentType) }
+                    .getOrDefault(DocumentType.PDF),
+                createdAt = entity.createdAt,
+                modifiedAt = entity.modifiedAt,
+                lastOpenedPage = entity.lastOpenedPage,
+                hasNativeTextLayer = entity.hasNativeTextLayer,
+                nativePdfText = "",
+                ocrRecognizedText = "",
+                scanPages = emptyList(),
+                currentlyUsingEnhanced = entity.currentlyUsingEnhanced,
+                activeScanFilterMode = ScanFilterMode.ENHANCED_COLOR,
+                keyVersion = keyVer,
+                encryptionStatus = DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED,
+                hasDigitalSignatures = false
+            )
         }
     }
 
     suspend fun getDocumentById(id: String): PaperworkDocument? = withContext(Dispatchers.IO) {
         val entity = documentDao.getDocumentById(id) ?: return@withContext null
-        decryptEntityToDomain(entity)
+        decryptEntityOrSurfaceUnreadable(entity)
     }
 
     /**
      * Loads and decrypts a document's thumbnail into the in-memory LruCache.
      */
     suspend fun loadDecryptedThumbnail(document: PaperworkDocument): Bitmap? = withContext(Dispatchers.IO) {
+        if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+            return@withContext null
+        }
         val cacheKey = "${document.id}_${document.modifiedAt}"
         thumbnailMemoryCache.get(cacheKey)?.let { return@withContext it }
 
@@ -142,12 +184,14 @@ class DocumentRepository(
         pageSize: PageSizeOption,
         orientation: PageOrientation,
         margin: MarginSize,
-        quality: PdfQuality
+        quality: PdfQuality,
+        filterMode: ScanFilterMode = if (useEnhancedByDefault) ScanFilterMode.ENHANCED_COLOR else ScanFilterMode.ORIGINAL
     ): PaperworkDocument = withContext(Dispatchers.IO) {
         val docId = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
         val cleanTitle = title.trim().ifBlank { "Scan $now" }
         val fileName = if (cleanTitle.endsWith(".pdf", ignoreCase = true)) cleanTitle else "$cleanTitle.pdf"
+        val activeKeyVer = cryptoManager.getCurrentKeyVersion()
 
         val scanRecords = mutableListOf<ScanPageRecord>()
         val pageSpecsForPdf = mutableListOf<PageImageSpec>()
@@ -156,7 +200,12 @@ class DocumentRepository(
         for (i in originalBitmaps.indices) {
             val pageId = "${docId}_p$i"
             val origBmp = originalBitmaps[i]
-            val enhBmp = enhancedBitmaps.getOrElse(i) { pdfEngine.createEnhancedDocumentBitmap(origBmp) }
+            val enhBmp = enhancedBitmaps.getOrElse(i) {
+                pdfEngine.createEnhancedDocumentBitmap(
+                    origBmp,
+                    if (filterMode == ScanFilterMode.ORIGINAL) ScanFilterMode.ENHANCED_COLOR else filterMode
+                )
+            }
             val rot = rotations.getOrElse(i) { 0 }
 
             val origFile = File(vaultScansDir, "${pageId}_orig.jpg.enc")
@@ -180,6 +229,7 @@ class DocumentRepository(
                     originalEncryptedPath = origFile.absolutePath,
                     enhancedEncryptedPath = enhFile.absolutePath,
                     activeEnhanced = useEnhancedByDefault,
+                    filterMode = filterMode,
                     rotationDegrees = rot
                 )
             )
@@ -187,7 +237,7 @@ class DocumentRepository(
             val selectedBmp = if (useEnhancedByDefault) enhBmp else origBmp
             pageSpecsForPdf.add(PageImageSpec(selectedBmp, rot))
 
-            // Run on-device OCR on the enhanced bitmap for searchable indexing
+            // Run on-device OCR on the enhanced bitmap for searchable OCR indexing (separate from native PDF text)
             val recognized = pdfEngine.recognizeTextWithMlKit(
                 pdfEngine.rotateBitmap(enhBmp, rot)
             )
@@ -216,8 +266,11 @@ class DocumentRepository(
         val sensitiveMeta = SensitiveDocumentMetadata(
             title = cleanTitle.removeSuffix(".pdf"),
             fileName = fileName,
-            extractedOcrText = ocrText,
-            scanPages = scanRecords
+            nativePdfText = "",
+            ocrRecognizedText = ocrText,
+            scanPages = scanRecords,
+            activeScanFilterMode = filterMode,
+            hasDigitalSignatures = false
         )
         val encryptedMetaBlob = cryptoManager.encryptBytes(
             plaintext = sensitiveMeta.toJsonBytes(),
@@ -236,19 +289,21 @@ class DocumentRepository(
             lastOpenedPage = 0,
             hasNativeTextLayer = false,
             currentlyUsingEnhanced = useEnhancedByDefault,
+            keyVersion = activeKeyVer,
             encryptedMetadataBlob = encryptedMetaBlob
         )
         documentDao.upsertDocument(entity)
-        decryptEntityToDomain(entity)!!
+        decryptEntityOrSurfaceUnreadable(entity)
     }
 
     /**
-     * Reversibly switches an existing scanned document between its preserved Original images
-     * and Enhanced images without ever destroying the original scan.
+     * Reversibly switches an existing scanned document between its preserved Original images,
+     * Enhanced Color, or Ink-Saving Grayscale without ever destroying the original scan.
      */
     suspend fun switchScanDocumentEnhancementMode(
         document: PaperworkDocument,
         useEnhanced: Boolean,
+        filterMode: ScanFilterMode = if (useEnhanced) ScanFilterMode.ENHANCED_COLOR else ScanFilterMode.ORIGINAL,
         pageSize: PageSizeOption = PageSizeOption.A4,
         quality: PdfQuality = PdfQuality.BALANCED
     ): PaperworkDocument? = withContext(Dispatchers.IO) {
@@ -258,9 +313,25 @@ class DocumentRepository(
         val pageSpecs = mutableListOf<PageImageSpec>()
 
         for (record in document.scanPages.sortedBy { it.pageIndex }) {
-            val bmp = loadScanPageBitmap(record, useEnhanced) ?: continue
-            pageSpecs.add(PageImageSpec(bmp, record.rotationDegrees))
-            updatedRecords.add(record.copy(activeEnhanced = useEnhanced))
+            val origBmp = loadScanPageBitmap(record, useEnhanced = false) ?: continue
+            val targetBmp = when (filterMode) {
+                ScanFilterMode.ORIGINAL -> origBmp
+                ScanFilterMode.ENHANCED_COLOR -> pdfEngine.createEnhancedDocumentBitmap(
+                    origBmp,
+                    ScanFilterMode.ENHANCED_COLOR
+                )
+                ScanFilterMode.INK_SAVING_GRAYSCALE -> pdfEngine.createEnhancedDocumentBitmap(
+                    origBmp,
+                    ScanFilterMode.INK_SAVING_GRAYSCALE
+                )
+            }
+            pageSpecs.add(PageImageSpec(targetBmp, record.rotationDegrees))
+            updatedRecords.add(
+                record.copy(
+                    activeEnhanced = filterMode != ScanFilterMode.ORIGINAL,
+                    filterMode = filterMode
+                )
+            )
         }
         if (pageSpecs.isEmpty()) return@withContext document
 
@@ -285,8 +356,11 @@ class DocumentRepository(
         val sensitiveMeta = SensitiveDocumentMetadata(
             title = document.title,
             fileName = document.fileName,
-            extractedOcrText = document.extractedOcrText,
-            scanPages = updatedRecords
+            nativePdfText = document.nativePdfText,
+            ocrRecognizedText = document.ocrRecognizedText,
+            scanPages = updatedRecords,
+            activeScanFilterMode = filterMode,
+            hasDigitalSignatures = document.hasDigitalSignatures
         )
         val encryptedMetaBlob = cryptoManager.encryptBytes(
             plaintext = sensitiveMeta.toJsonBytes(),
@@ -304,11 +378,12 @@ class DocumentRepository(
             modifiedAt = now,
             lastOpenedPage = document.lastOpenedPage,
             hasNativeTextLayer = document.hasNativeTextLayer,
-            currentlyUsingEnhanced = useEnhanced,
+            currentlyUsingEnhanced = filterMode != ScanFilterMode.ORIGINAL,
+            keyVersion = cryptoManager.getCurrentKeyVersion(),
             encryptedMetadataBlob = encryptedMetaBlob
         )
         documentDao.upsertDocument(updatedEntity)
-        decryptEntityToDomain(updatedEntity)
+        decryptEntityOrSurfaceUnreadable(updatedEntity)
     }
 
     /**
@@ -356,8 +431,11 @@ class DocumentRepository(
         val sensitiveMeta = SensitiveDocumentMetadata(
             title = cleanTitle.removeSuffix(".pdf"),
             fileName = fileName,
-            extractedOcrText = ocrBuilder.toString().trim(),
-            scanPages = emptyList()
+            nativePdfText = "",
+            ocrRecognizedText = ocrBuilder.toString().trim(),
+            scanPages = emptyList(),
+            activeScanFilterMode = ScanFilterMode.ORIGINAL,
+            hasDigitalSignatures = false
         )
         val encryptedMetaBlob = cryptoManager.encryptBytes(
             plaintext = sensitiveMeta.toJsonBytes(),
@@ -376,14 +454,15 @@ class DocumentRepository(
             lastOpenedPage = 0,
             hasNativeTextLayer = false,
             currentlyUsingEnhanced = true,
+            keyVersion = cryptoManager.getCurrentKeyVersion(),
             encryptedMetadataBlob = encryptedMetaBlob
         )
         documentDao.upsertDocument(entity)
-        decryptEntityToDomain(entity)!!
+        decryptEntityOrSurfaceUnreadable(entity)
     }
 
     /**
-     * Imports an external PDF from a content Uri into the hardware-encrypted vault.
+     * Imports an external PDF from a content Uri into the Keystore-encrypted vault.
      */
     suspend fun importExternalPdfUri(uri: Uri, suggestedDisplayName: String?): PaperworkDocument? =
         withContext(Dispatchers.IO) {
@@ -416,7 +495,7 @@ class DocumentRepository(
             tempInspectFile.writeBytes(rawPdfBytes)
             pdfEngine.inspectPdfFile(tempInspectFile)
         } finally {
-            cryptoManager.secureDeleteFile(tempInspectFile)
+            cryptoManager.deleteFileSafely(tempInspectFile)
         }
 
         val encryptedPdfFile = File(vaultPdfDir, "$docId.pdf.enc")
@@ -427,8 +506,11 @@ class DocumentRepository(
         val sensitiveMeta = SensitiveDocumentMetadata(
             title = title,
             fileName = fileName,
-            extractedOcrText = inspection.nativeExtractedText,
-            scanPages = emptyList()
+            nativePdfText = inspection.nativeExtractedText,
+            ocrRecognizedText = "",
+            scanPages = emptyList(),
+            activeScanFilterMode = ScanFilterMode.ORIGINAL,
+            hasDigitalSignatures = inspection.hasDigitalSignatures
         )
         val encryptedMetaBlob = cryptoManager.encryptBytes(
             plaintext = sensitiveMeta.toJsonBytes(),
@@ -447,14 +529,18 @@ class DocumentRepository(
             lastOpenedPage = 0,
             hasNativeTextLayer = inspection.hasNativeTextLayer,
             currentlyUsingEnhanced = true,
+            keyVersion = cryptoManager.getCurrentKeyVersion(),
             encryptedMetadataBlob = encryptedMetaBlob
         )
         documentDao.upsertDocument(entity)
-        decryptEntityToDomain(entity)!!
+        decryptEntityOrSurfaceUnreadable(entity)
     }
 
     suspend fun renameDocument(document: PaperworkDocument, newTitle: String): PaperworkDocument? =
         withContext(Dispatchers.IO) {
+            if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+                return@withContext document
+            }
             val clean = newTitle.trim().ifBlank { return@withContext document }
             val newFileName = if (clean.endsWith(".pdf", ignoreCase = true)) clean else "$clean.pdf"
             val now = System.currentTimeMillis()
@@ -462,8 +548,11 @@ class DocumentRepository(
             val meta = SensitiveDocumentMetadata(
                 title = clean.removeSuffix(".pdf"),
                 fileName = newFileName,
-                extractedOcrText = document.extractedOcrText,
-                scanPages = document.scanPages
+                nativePdfText = document.nativePdfText,
+                ocrRecognizedText = document.ocrRecognizedText,
+                scanPages = document.scanPages,
+                activeScanFilterMode = document.activeScanFilterMode,
+                hasDigitalSignatures = document.hasDigitalSignatures
             )
             val encryptedBlob = cryptoManager.encryptBytes(
                 plaintext = meta.toJsonBytes(),
@@ -481,19 +570,26 @@ class DocumentRepository(
                 lastOpenedPage = document.lastOpenedPage,
                 hasNativeTextLayer = document.hasNativeTextLayer,
                 currentlyUsingEnhanced = document.currentlyUsingEnhanced,
+                keyVersion = cryptoManager.getCurrentKeyVersion(),
                 encryptedMetadataBlob = encryptedBlob
             )
             documentDao.upsertDocument(entity)
-            decryptEntityToDomain(entity)
+            decryptEntityOrSurfaceUnreadable(entity)
         }
 
     suspend fun updateExtractedOcrText(document: PaperworkDocument, newOcrText: String): PaperworkDocument? =
         withContext(Dispatchers.IO) {
+            if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+                return@withContext document
+            }
             val meta = SensitiveDocumentMetadata(
                 title = document.title,
                 fileName = document.fileName,
-                extractedOcrText = newOcrText,
-                scanPages = document.scanPages
+                nativePdfText = document.nativePdfText,
+                ocrRecognizedText = newOcrText,
+                scanPages = document.scanPages,
+                activeScanFilterMode = document.activeScanFilterMode,
+                hasDigitalSignatures = document.hasDigitalSignatures
             )
             val encryptedBlob = cryptoManager.encryptBytes(
                 plaintext = meta.toJsonBytes(),
@@ -511,14 +607,18 @@ class DocumentRepository(
                 lastOpenedPage = document.lastOpenedPage,
                 hasNativeTextLayer = document.hasNativeTextLayer,
                 currentlyUsingEnhanced = document.currentlyUsingEnhanced,
+                keyVersion = cryptoManager.getCurrentKeyVersion(),
                 encryptedMetadataBlob = encryptedBlob
             )
             documentDao.upsertDocument(entity)
-            decryptEntityToDomain(entity)
+            decryptEntityOrSurfaceUnreadable(entity)
         }
 
     suspend fun duplicateDocument(document: PaperworkDocument): PaperworkDocument? =
         withContext(Dispatchers.IO) {
+            if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+                return@withContext null
+            }
             val srcFile = File(document.encryptedPdfPath)
             if (!srcFile.exists()) return@withContext null
             val decryptedBytes = cryptoManager.decryptFromFile(srcFile, aad = document.id)
@@ -534,24 +634,32 @@ class DocumentRepository(
     }
 
     /**
-     * Securely overwrites and deletes the PDF, thumbnail, and all preserved Original & Enhanced
+     * Deletes the encrypted PDF, thumbnail, and all preserved Original & Enhanced
      * scan bitmaps for a document.
      */
     suspend fun deleteDocument(document: PaperworkDocument) = withContext(Dispatchers.IO) {
-        cryptoManager.secureDeleteFile(File(document.encryptedPdfPath))
-        document.encryptedThumbnailPath?.let { cryptoManager.secureDeleteFile(File(it)) }
+        cryptoManager.deleteFileSafely(File(document.encryptedPdfPath))
+        document.encryptedThumbnailPath?.let { cryptoManager.deleteFileSafely(File(it)) }
         document.scanPages.forEach { page ->
-            cryptoManager.secureDeleteFile(File(page.originalEncryptedPath))
-            cryptoManager.secureDeleteFile(File(page.enhancedEncryptedPath))
+            cryptoManager.deleteFileSafely(File(page.originalEncryptedPath))
+            cryptoManager.deleteFileSafely(File(page.enhancedEncryptedPath))
         }
         documentDao.deleteDocumentById(document.id)
+    }
+
+    /**
+     * Purges unreadable documents encrypted under an invalidated key version (`v{N}`)
+     * after the user explicitly confirms creating a new replacement key (`v{N+1}`).
+     */
+    suspend fun purgeUnreadableOldKeyDocuments(activeKeyVersion: Int) = withContext(Dispatchers.IO) {
+        documentDao.deleteDocumentsWithOldKeyVersions(activeKeyVersion)
     }
 
     /**
      * Generates two realistic sample documents on user request:
      * 1. A 3-page Vector PDF (`Paperwork Architecture & Invoice Guide.pdf`) with native selectable text.
      * 2. A 2-page Scanned Document (`Pacific Hardware Receipt (Scanned).pdf`) preserving both warm
-     *    Original camera captures and crisp Enhanced pages so Original/Enhanced toggling and ML Kit OCR
+     *    Original camera captures and crisp Enhanced Color pages so Original/Enhanced toggling and ML Kit OCR
      *    can be tested immediately.
      */
     suspend fun generateSampleDocuments() = withContext(Dispatchers.IO) {
@@ -567,11 +675,13 @@ class DocumentRepository(
                 documentType = DocumentType.PDF
             )
         } finally {
-            cryptoManager.secureDeleteFile(tempVectorFile)
+            cryptoManager.deleteFileSafely(tempVectorFile)
         }
 
         val originalBitmaps = pdfEngine.createSampleScannedBitmaps()
-        val enhancedBitmaps = originalBitmaps.map { pdfEngine.createEnhancedDocumentBitmap(it) }
+        val enhancedBitmaps = originalBitmaps.map {
+            pdfEngine.createEnhancedDocumentBitmap(it, ScanFilterMode.ENHANCED_COLOR)
+        }
         saveScannedDocument(
             title = "Pacific Hardware Receipt (Scanned)",
             originalBitmaps = originalBitmaps,
@@ -581,7 +691,8 @@ class DocumentRepository(
             pageSize = PageSizeOption.A4,
             orientation = PageOrientation.PORTRAIT,
             margin = MarginSize.SMALL,
-            quality = PdfQuality.BALANCED
+            quality = PdfQuality.BALANCED,
+            filterMode = ScanFilterMode.ENHANCED_COLOR
         )
     }
 

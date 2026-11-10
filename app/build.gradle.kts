@@ -14,7 +14,7 @@ android {
 
   defaultConfig {
     applicationId = "com.aistudio.paperwork.pwxkqm"
-    minSdk = 24
+    minSdk = 28
     targetSdk = 36
     versionCode = 1
     versionName = "1.0.0"
@@ -78,15 +78,13 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-tasks.matching { it.name.startsWith("check") && it.name.endsWith("AarMetadata") }.configureEach {
-  enabled = false
-}
-
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
   implementation(libs.androidx.activity.compose)
   implementation(libs.androidx.appcompat)
   implementation(libs.androidx.fragment.ktx)
+  implementation(libs.androidx.biometric)
+  implementation(libs.androidx.exifinterface)
   implementation(libs.androidx.camera.camera2)
   implementation(libs.androidx.camera.core)
   implementation(libs.androidx.camera.lifecycle)
@@ -108,33 +106,17 @@ dependencies {
   implementation(libs.androidx.room.runtime)
   implementation(libs.coil.compose)
 
-  // Official Jetpack PDF Viewer & Compose integration
   implementation(libs.androidx.pdf.viewer)
   implementation(libs.androidx.pdf.viewer.fragment)
-  implementation(libs.androidx.pdf.compose)
   implementation(libs.androidx.pdf.document.service)
   implementation(libs.androidx.pdf.ocr.play.services)
 
-  // Vector-preserving PDF manipulation (Apache 2.0)
   implementation(libs.pdfbox.android)
-
-  // ML Kit Document Scanner & On-Device OCR
   implementation(libs.play.services.mlkit.document.scanner)
   implementation(libs.play.services.mlkit.text.recognition)
 
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
-
-  // Unused template dependencies commented out for APK size optimization:
-  // implementation(platform(libs.firebase.bom))
-  // implementation(libs.firebase.ai)
-  // implementation(libs.firebase.appcheck.recaptcha)
-  // implementation(libs.firebase.appcheck.debug)
-  // implementation(libs.retrofit)
-  // implementation(libs.converter.moshi)
-  // implementation(libs.okhttp)
-  // implementation(libs.logging.interceptor)
-  // implementation(libs.moshi.kotlin)
 
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)

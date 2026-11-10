@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Palette
@@ -27,6 +28,7 @@ import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.Scanner
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -57,6 +59,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.example.core.security.KeystoreSecurityLevel
+import com.example.core.security.VaultKeyState
 import com.example.data.preferences.UserPreferencesState
 import com.example.domain.model.PageSizeOption
 import com.example.domain.model.PdfQuality
@@ -68,21 +72,29 @@ import com.example.ui.components.formatFileSize
 @Composable
 fun SettingsScreen(
     preferences: UserPreferencesState,
+    keystoreSecurityLevel: KeystoreSecurityLevel,
+    vaultKeyState: VaultKeyState,
+    activeKeyVersion: Int,
+    biometricAvailable: Boolean,
     vaultStorageBytes: Long,
     documentCount: Int,
+    unreadableDocumentCount: Int = 0,
     onThemeChange: (ThemePreference) -> Unit,
     onDefaultQualityChange: (PdfQuality) -> Unit,
     onDefaultPageSizeChange: (PageSizeOption) -> Unit,
     onDefaultPrintOrderChange: (PrintPageOrder) -> Unit,
     onDefaultEnhancedScanChange: (Boolean) -> Unit,
+    onBiometricUnlockChange: (Boolean) -> Unit,
     onConfigurePin: (String) -> Unit,
     onDisablePin: () -> Unit,
     onLockVaultNow: () -> Unit,
+    onCreateReplacementKeyAfterInvalidation: (Boolean) -> Unit,
     onPurgeTempCache: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var showPinSetupDialog by remember { mutableStateOf(false) }
     var showPrivacyPolicyDialog by remember { mutableStateOf(false) }
+    var showKeyRecoveryDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = modifier
@@ -99,7 +111,7 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    text = "Appearance, hardware Keystore AES-256-GCM encryption, scanner defaults, and privacy.",
+                    text = "Appearance, Android Keystore AES-256-GCM encryption, Biometric/PIN access lock, and defaults.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -151,7 +163,7 @@ fun SettingsScreen(
             }
         }
 
-        // 2. Security & Hardware Encryption Architecture
+        // 2. Versioned Keystore Encryption & App Access Lock Boundary
         item {
             Card(
                 shape = RoundedCornerShape(16.dp),
@@ -173,13 +185,14 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "Local Encryption & PIN Lock",
+                                text = "Vault Encryption & Access Lock",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Text(
-                                text = "Android Keystore AES-256-GCM (No deprecated MasterKey)",
+                                text = "Key v$activeKeyVersion • ${keystoreSecurityLevel.label} • State: ${vaultKeyState.name}",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.SemiBold
                             )
                         }
                     }
@@ -188,14 +201,63 @@ fun SettingsScreen(
                         shape = RoundedCornerShape(12.dp),
                         color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)
                     ) {
-                        Text(
-                            text = "Encrypted Assets: PDF files, Original & Enhanced scan layers, document thumbnails, and Room database metadata/OCR caches (bound with GCM Associated Authenticated Data). Excluded from cloud backups.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            modifier = Modifier.padding(12.dp)
-                        )
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "19-Byte PWKV Header & Unique 12-Byte IV: Every PDF, Original/Enhanced scan, thumbnail, and Room metadata blob is encrypted with a fresh 96-bit SecureRandom IV and bound to its ID via GCM AAD.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Text(
+                                text = "Key Invalidation Disclosure: Because Paperwork is 100% local with zero cloud key escrow, if the OS invalidates your Keystore key, files encrypted with the old key version become permanently unreadable unless previously exported.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
                     }
 
+                    if (vaultKeyState == VaultKeyState.INVALIDATED ||
+                        vaultKeyState == VaultKeyState.RECOVERY_REQUIRED ||
+                        unreadableDocumentCount > 0
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.errorContainer
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "Keystore Key Recovery Required ($vaultKeyState)",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                                Text(
+                                    text = "Creating a new Keystore key (v${activeKeyVersion + 1}) allows new documents to be encrypted, but CANNOT decrypt $unreadableDocumentCount existing document(s) encrypted with an invalidated key.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                                Button(
+                                    onClick = { showKeyRecoveryDialog = true }
+                                ) {
+                                    Text("Provision New Key (v${activeKeyVersion + 1})")
+                                }
+                            }
+                        }
+                    }
+
+                    // App Access Lock (PIN + Biometric/Device Credential)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -203,14 +265,14 @@ fun SettingsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "4-digit App PIN Lock",
+                                text = "App Access Lock (4-digit PIN + Biometric)",
                                 style = MaterialTheme.typography.titleSmall
                             )
                             Text(
                                 text = if (preferences.pinEnabled) {
-                                    "Active • Salted PBKDF2-HMAC-SHA256 (120k iterations)"
+                                    "UI Session Gate Active • PBKDF2-HMAC-SHA256 (120k iterations)"
                                 } else {
-                                    "Optional PIN gate separated from hardware encryption key"
+                                    "UI access lock separated from the Keystore AES-256-GCM key"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -231,6 +293,30 @@ fun SettingsScreen(
                     }
 
                     if (preferences.pinEnabled) {
+                        if (biometricAvailable) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Allow Biometric / Device Credential Unlock",
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text(
+                                        text = "Use fingerprint, face, or OS screen lock on the unlock gate",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Switch(
+                                    checked = preferences.biometricUnlockEnabled,
+                                    onCheckedChange = onBiometricUnlockChange
+                                )
+                            }
+                        }
+
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             OutlinedButton(
                                 onClick = { showPinSetupDialog = true },
@@ -287,11 +373,11 @@ fun SettingsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Default to Enhanced scan preview",
+                                text = "Default to Enhanced Color scan preview",
                                 style = MaterialTheme.typography.titleSmall
                             )
                             Text(
-                                text = "Original scan is always preserved permanently",
+                                text = "Preserves color stamps & ink while original scan is kept permanently",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -381,7 +467,7 @@ fun SettingsScreen(
                     )
 
                     Text(
-                        text = "Save location: App-private hardware-encrypted vault (/files/vault_pdfs & /files/vault_scans)",
+                        text = "Flash Storage Note: Paperwork encrypts all vault assets prior to writing to flash storage and deletes temporary viewer/print session files deterministically on close.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -392,7 +478,7 @@ fun SettingsScreen(
                     ) {
                         Icon(Icons.Default.CleaningServices, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Wipe Temporary Decrypted Session Cache")
+                        Text("Clean Temporary Decrypted Session Cache")
                     }
                 }
             }
@@ -424,7 +510,7 @@ fun SettingsScreen(
                         )
                     }
                     Text(
-                        text = "Version 1.0.0 • Material 3 Expressive • Official Jetpack PDF 1.0.0-beta01 + Apache PDFBox-Android 2.0.27.0 + ML Kit Document Scanner",
+                        text = "Version 1.0.0 • minSdk 28 • Official AndroidX PDF 1.0.0-beta01 + Apache PDFBox-Android 2.0.27.0 + ML Kit Document Scanner",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -434,7 +520,7 @@ fun SettingsScreen(
                     ) {
                         Icon(Icons.Default.PrivacyTip, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Privacy & Local Encryption Policy")
+                        Text("Privacy & Security Architecture")
                     }
                 }
             }
@@ -449,11 +535,11 @@ fun SettingsScreen(
         var pinInput by remember { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { showPinSetupDialog = false },
-            title = { Text("Set 4-digit Vault PIN") },
+            title = { Text("Set 4-digit App Access PIN") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "Your PIN is hashed with a 16-byte cryptographic salt using PBKDF2-HMAC-SHA256 (120,000 iterations) and is separated from the Android Keystore AES-256-GCM key.",
+                        text = "Your 4-digit PIN acts as an application UI access lock (hashed with a 16-byte salt via PBKDF2-HMAC-SHA256, 120,000 iterations) with retry cooldowns. It is not the cryptographic encryption key itself; you can also unlock via Biometrics or Device Credentials.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -490,6 +576,39 @@ fun SettingsScreen(
         )
     }
 
+    if (showKeyRecoveryDialog) {
+        AlertDialog(
+            onDismissRequest = { showKeyRecoveryDialog = false },
+            title = { Text("Create New Keystore Key (v${activeKeyVersion + 1})?") },
+            text = {
+                Text(
+                    text = "Generating a new Keystore key allows new documents to be encrypted, but CANNOT decrypt files encrypted with the invalidated old key (v$activeKeyVersion). Would you also like to purge unreadable old-key records?",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showKeyRecoveryDialog = false
+                        onCreateReplacementKeyAfterInvalidation(true)
+                    }
+                ) {
+                    Text("Create Key & Purge Old Records")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showKeyRecoveryDialog = false
+                        onCreateReplacementKeyAfterInvalidation(false)
+                    }
+                ) {
+                    Text("Create Key (Keep Records Marked Unreadable)")
+                }
+            }
+        )
+    }
+
     if (showPrivacyPolicyDialog) {
         AlertDialog(
             onDismissRequest = { showPrivacyPolicyDialog = false },
@@ -497,15 +616,15 @@ fun SettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        text = "1. 100% On-Device Processing: Paperwork processes all scans, PDF conversions, OCR text recognition, and print jobs locally on your device. No documents are ever uploaded to external servers.",
+                        text = "1. 100% On-Device Processing: Paperwork processes all scans, PDF conversions, embedded text extraction, ML Kit OCR, and print jobs locally on your device.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
-                        text = "2. Hardware-Backed AES-256-GCM: PDF files, Original & Enhanced scan layers, thumbnails, and Room database metadata/OCR caches are encrypted with a 256-bit AES-GCM key inside AndroidKeyStore.",
+                        text = "2. Versioned Keystore AES-256-GCM: Every encrypted asset carries a 19-byte PWKV header with a unique 12-byte random IV. Detected Keystore backing on this device: ${keystoreSecurityLevel.label}.",
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
-                        text = "3. Zero Broad Storage Permissions: Paperwork uses Android's zero-permission Photo Picker and Storage Access Framework (SAF), and excludes vault files from cloud backups.",
+                        text = "3. Flash Storage & Session Lifecycle: Because wear-leveled flash storage (F2FS/ext4) cannot be physically erased via userspace byte overwrites, Paperwork encrypts data prior to persistence and cleans up temporary viewer/print session files deterministically.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -523,6 +642,8 @@ fun SettingsScreen(
 fun PinLockGateScreen(
     failedAttempts: Int,
     lockoutUntilEpochMs: Long,
+    biometricEnabled: Boolean = false,
+    onRequestBiometricUnlock: (() -> Unit)? = null,
     onUnlockAttempt: (String, (Boolean, String?) -> Unit) -> Unit
 ) {
     var pinInput by remember { mutableStateOf("") }
@@ -563,7 +684,7 @@ fun PinLockGateScreen(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "Enter your 4-digit PIN to access your AES-256-GCM encrypted documents.",
+                    text = "Enter your 4-digit PIN or use Biometric / Device Credential authentication to access your encrypted documents.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
@@ -610,7 +731,21 @@ fun PinLockGateScreen(
                         .height(48.dp)
                         .testTag("pin_unlock_submit_button")
                 ) {
-                    Text("Unlock Vault")
+                    Text("Unlock with PIN")
+                }
+
+                if (biometricEnabled && onRequestBiometricUnlock != null) {
+                    FilledTonalButton(
+                        onClick = onRequestBiometricUnlock,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("biometric_unlock_button")
+                    ) {
+                        Icon(Icons.Default.Fingerprint, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Unlock with Biometric / Device Lock")
+                    }
                 }
             }
         }

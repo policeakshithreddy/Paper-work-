@@ -8,18 +8,20 @@ import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
+import com.example.domain.model.ScanFilterMode
+import com.example.domain.model.ScanPageRecord
 import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
 import org.json.JSONObject
-import com.example.domain.model.ScanPageRecord
 
 /**
  * Room Entity storing document records.
  *
  * Security Architecture:
- * Sensitive metadata (`title`, `fileName`, `extractedOcrText`, `scanPagesJson`) is never stored
- * in plaintext SQLite columns. Instead, it is serialized to JSON and encrypted with
- * Android Keystore AES-256-GCM inside [encryptedMetadataBlob], binding [id] as GCM AAD.
+ * Sensitive metadata (`title`, `fileName`, `nativePdfText`, `ocrRecognizedText`, `scanPagesJson`)
+ * is never stored in plaintext SQLite columns. Instead, it is serialized to JSON and encrypted with
+ * Android Keystore AES-256-GCM inside [encryptedMetadataBlob], binding [id] as GCM AAD and
+ * storing the 19-byte `PWKV` versioned header.
  */
 @Entity(tableName = "vault_documents")
 data class DocumentEntity(
@@ -34,6 +36,7 @@ data class DocumentEntity(
     val lastOpenedPage: Int,
     val hasNativeTextLayer: Boolean,
     val currentlyUsingEnhanced: Boolean,
+    val keyVersion: Int = 1,
     val encryptedMetadataBlob: ByteArray
 ) {
     override fun equals(other: Any?): Boolean {
@@ -45,12 +48,14 @@ data class DocumentEntity(
             fileSize == other.fileSize &&
             currentlyUsingEnhanced == other.currentlyUsingEnhanced &&
             lastOpenedPage == other.lastOpenedPage &&
+            keyVersion == other.keyVersion &&
             encryptedMetadataBlob.contentEquals(other.encryptedMetadataBlob)
     }
 
     override fun hashCode(): Int {
         var result = id.hashCode()
         result = 31 * result + modifiedAt.hashCode()
+        result = 31 * result + keyVersion
         result = 31 * result + encryptedMetadataBlob.contentHashCode()
         return result
     }
@@ -58,18 +63,26 @@ data class DocumentEntity(
 
 /**
  * Sensitive payload encrypted inside [DocumentEntity.encryptedMetadataBlob].
+ * Keeps [nativePdfText] (embedded PDF text streams) and [ocrRecognizedText] (ML Kit OCR output)
+ * strictly separate.
  */
 data class SensitiveDocumentMetadata(
     val title: String,
     val fileName: String,
-    val extractedOcrText: String,
-    val scanPages: List<ScanPageRecord>
+    val nativePdfText: String,
+    val ocrRecognizedText: String,
+    val scanPages: List<ScanPageRecord>,
+    val activeScanFilterMode: ScanFilterMode = ScanFilterMode.ENHANCED_COLOR,
+    val hasDigitalSignatures: Boolean = false
 ) {
     fun toJsonBytes(): ByteArray {
         val root = JSONObject()
         root.put("title", title)
         root.put("fileName", fileName)
-        root.put("extractedOcrText", extractedOcrText)
+        root.put("nativePdfText", nativePdfText)
+        root.put("ocrRecognizedText", ocrRecognizedText)
+        root.put("activeScanFilterMode", activeScanFilterMode.name)
+        root.put("hasDigitalSignatures", hasDigitalSignatures)
         val pagesArray = JSONArray()
         scanPages.forEach { page ->
             val obj = JSONObject()
@@ -78,6 +91,7 @@ data class SensitiveDocumentMetadata(
             obj.put("originalEncryptedPath", page.originalEncryptedPath)
             obj.put("enhancedEncryptedPath", page.enhancedEncryptedPath)
             obj.put("activeEnhanced", page.activeEnhanced)
+            obj.put("filterMode", page.filterMode.name)
             obj.put("rotationDegrees", page.rotationDegrees)
             pagesArray.put(obj)
         }
@@ -92,6 +106,9 @@ data class SensitiveDocumentMetadata(
             val pages = mutableListOf<ScanPageRecord>()
             for (i in 0 until pagesArray.length()) {
                 val obj = pagesArray.getJSONObject(i)
+                val filterMode = runCatching {
+                    ScanFilterMode.valueOf(obj.optString("filterMode", ScanFilterMode.ENHANCED_COLOR.name))
+                }.getOrDefault(ScanFilterMode.ENHANCED_COLOR)
                 pages.add(
                     ScanPageRecord(
                         pageId = obj.optString("pageId", "page_$i"),
@@ -99,15 +116,28 @@ data class SensitiveDocumentMetadata(
                         originalEncryptedPath = obj.optString("originalEncryptedPath", ""),
                         enhancedEncryptedPath = obj.optString("enhancedEncryptedPath", ""),
                         activeEnhanced = obj.optBoolean("activeEnhanced", true),
+                        filterMode = filterMode,
                         rotationDegrees = obj.optInt("rotationDegrees", 0)
                     )
                 )
             }
+            val legacyExtracted = root.optString("extractedOcrText", "")
+            val nativePdfText = root.optString("nativePdfText", "")
+            val ocrText = root.optString("ocrRecognizedText", legacyExtracted)
+            val activeFilter = runCatching {
+                ScanFilterMode.valueOf(
+                    root.optString("activeScanFilterMode", ScanFilterMode.ENHANCED_COLOR.name)
+                )
+            }.getOrDefault(ScanFilterMode.ENHANCED_COLOR)
+
             return SensitiveDocumentMetadata(
                 title = root.optString("title", "Untitled document"),
                 fileName = root.optString("fileName", "document.pdf"),
-                extractedOcrText = root.optString("extractedOcrText", ""),
-                scanPages = pages
+                nativePdfText = nativePdfText,
+                ocrRecognizedText = ocrText,
+                scanPages = pages,
+                activeScanFilterMode = activeFilter,
+                hasDigitalSignatures = root.optBoolean("hasDigitalSignatures", false)
             )
         }
     }
@@ -130,11 +160,14 @@ interface DocumentDao {
     @Query("DELETE FROM vault_documents WHERE id = :id")
     suspend fun deleteDocumentById(id: String)
 
+    @Query("DELETE FROM vault_documents WHERE keyVersion != :activeKeyVersion")
+    suspend fun deleteDocumentsWithOldKeyVersions(activeKeyVersion: Int)
+
     @Query("DELETE FROM vault_documents")
     suspend fun deleteAllDocuments()
 }
 
-@Database(entities = [DocumentEntity::class], version = 1, exportSchema = false)
+@Database(entities = [DocumentEntity::class], version = 2, exportSchema = false)
 abstract class PaperworkDatabase : RoomDatabase() {
     abstract fun documentDao(): DocumentDao
 }

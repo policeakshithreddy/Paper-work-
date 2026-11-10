@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -59,8 +60,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.core.security.VaultKeyState
+import com.example.domain.model.DocumentEncryptionStatus
 import com.example.domain.model.PaperworkDocument
 import com.example.domain.model.ThemePreference
 import com.example.features.documents.DocumentsScreen
@@ -132,6 +136,8 @@ fun PaperworkAppRoot(
     val vaultStorageBytes by viewModel.vaultStorageBytes.collectAsStateWithLifecycle()
     val scannerState by viewModel.scannerState.collectAsStateWithLifecycle()
     val conversionState by viewModel.conversionState.collectAsStateWithLifecycle()
+    val vaultKeyState by viewModel.cryptoManager.vaultKeyState.collectAsStateWithLifecycle()
+    val keystoreSecurityLevel by viewModel.cryptoManager.detectedSecurityLevel.collectAsStateWithLifecycle()
 
     val isDarkTheme = when (preferences.themePreference) {
         ThemePreference.SYSTEM -> isSystemInDarkTheme()
@@ -165,6 +171,12 @@ fun PaperworkAppRoot(
         val activeViewerDocument = remember(allDocuments, activeViewerDocId) {
             allDocuments.find { it.id == activeViewerDocId }
         }
+        val unreadableCount = remember(allDocuments) {
+            allDocuments.count { it.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED }
+        }
+        val biometricAvailable = remember {
+            viewModel.accessLockManager.canAuthenticateWithBiometricOrDeviceCredential()
+        }
 
         // 1. Official Google ML Kit Document Scanner ActivityResultLauncher
         val mlKitScannerLauncher = rememberLauncherForActivityResult(
@@ -178,6 +190,8 @@ fun PaperworkAppRoot(
                         isScannerStudioOpen = true
                     }
                 }
+            } else {
+                viewModel.cancelSinglePageRetake()
             }
         }
 
@@ -188,7 +202,7 @@ fun PaperworkAppRoot(
             try {
                 val options = GmsDocumentScannerOptions.Builder()
                     .setGalleryImportAllowed(true)
-                    .setPageLimit(30)
+                    .setPageLimit(if (scannerState.isRetakingCurrentPage) 1 else 30)
                     .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
                     .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
                     .build()
@@ -257,11 +271,22 @@ fun PaperworkAppRoot(
             documentPendingSafExport = null
         }
 
-        // Optional 4-digit PIN Gate
+        // Optional App Access Lock (4-digit PIN + Biometric / Device Credential)
         if (preferences.pinEnabled && !isSessionUnlocked) {
             PinLockGateScreen(
                 failedAttempts = preferences.failedPinAttempts,
                 lockoutUntilEpochMs = preferences.lockoutUntilEpochMs,
+                biometricEnabled = preferences.biometricUnlockEnabled && biometricAvailable,
+                onRequestBiometricUnlock = {
+                    val fragActivity = activity as? FragmentActivity
+                    if (fragActivity != null) {
+                        viewModel.accessLockManager.promptBiometricOrDeviceCredential(
+                            activity = fragActivity,
+                            onSuccess = { viewModel.onBiometricUnlockSucceeded() },
+                            onError = { err -> viewModel.showMessage(err) }
+                        )
+                    }
+                },
                 onUnlockAttempt = { pin, callback ->
                     viewModel.attemptPinUnlock(pin, callback)
                 }
@@ -269,19 +294,29 @@ fun PaperworkAppRoot(
             return@PaperworkTheme
         }
 
-        // Keystore Key Invalidation Recovery Alert
-        if (viewModel.cryptoManager.keyInvalidatedEvent) {
+        // Explicit 4-State Keystore Key Invalidation Recovery Dialog
+        if (vaultKeyState == VaultKeyState.INVALIDATED || vaultKeyState == VaultKeyState.RECOVERY_REQUIRED) {
+            val currentVer = viewModel.cryptoManager.getCurrentKeyVersion()
             AlertDialog(
-                onDismissRequest = { viewModel.cryptoManager.acknowledgeKeyRecovery() },
-                title = { Text("Hardware Key Recovery") },
+                onDismissRequest = { viewModel.cryptoManager.transitionToRecoveryRequired() },
+                title = { Text("Keystore Key Invalidated (v$currentVer)") },
                 text = {
                     Text(
-                        "Android Keystore reported a device lockscreen security reset. Paperwork has safely provisioned a fresh 256-bit AES-GCM key so new documents remain protected."
+                        "Android Keystore reported that key v$currentVer was permanently invalidated by an OS security state change. Generating a new key (v${currentVer + 1}) allows new documents to be encrypted, but CANNOT decrypt files encrypted with key v$currentVer."
                     )
                 },
                 confirmButton = {
-                    TextButton(onClick = { viewModel.cryptoManager.acknowledgeKeyRecovery() }) {
-                        Text("Acknowledge")
+                    Button(
+                        onClick = { viewModel.createReplacementKeyAfterInvalidation(purgeUnreadableOldDocuments = false) }
+                    ) {
+                        Text("Create New Key (v${currentVer + 1})")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { viewModel.createReplacementKeyAfterInvalidation(purgeUnreadableOldDocuments = true) }
+                    ) {
+                        Text("Create Key & Purge Old Records")
                     }
                 }
             )
@@ -291,7 +326,11 @@ fun PaperworkAppRoot(
         when {
             isCameraXFallbackOpen -> {
                 CameraXFallbackScannerScreen(
-                    onBack = { isCameraXFallbackOpen = false },
+                    isRetakeMode = scannerState.isRetakingCurrentPage,
+                    onBack = {
+                        viewModel.cancelSinglePageRetake()
+                        isCameraXFallbackOpen = false
+                    },
                     onBitmapCaptured = { bmp ->
                         viewModel.appendCapturedScanBitmap(bmp) {
                             isCameraXFallbackOpen = false
@@ -312,6 +351,10 @@ fun PaperworkAppRoot(
                     onBack = { isScannerStudioOpen = false },
                     onLaunchMlKitOrCameraScan = launchPrimaryMlKitOrFallbackScanner,
                     onOpenInAppCameraFallback = { isCameraXFallbackOpen = true },
+                    onRetakeCurrentPage = {
+                        viewModel.prepareSinglePageRetake()
+                        isCameraXFallbackOpen = true
+                    },
                     onImportFromGallery = {
                         scannerPhotoPickerLauncher.launch(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
@@ -321,9 +364,11 @@ fun PaperworkAppRoot(
                         isCameraXFallbackOpen = true
                     },
                     onSelectPage = { viewModel.selectScannerPage(it) },
-                    onToggleEnhancedMode = { viewModel.setScannerEnhancedMode(it) },
+                    onSelectFilterMode = { viewModel.setScannerFilterMode(it) },
                     onRotateCurrentPage = { viewModel.rotateCurrentScannerPage() },
-                    onCropCurrentPage = { l, t, r, b -> viewModel.cropCurrentScannerPage(l, t, r, b) },
+                    onCropAndDeskewCurrentPage = { l, t, r, b, angle ->
+                        viewModel.cropAndDeskewCurrentScannerPage(l, t, r, b, angle)
+                    },
                     onMovePage = { from, to -> viewModel.moveScannerPage(from, to) },
                     onDeleteCurrentPage = { viewModel.deleteCurrentScannerPage() },
                     onUpdateSaveConfig = { title, quality, size, orient, margin ->
@@ -353,6 +398,13 @@ fun PaperworkAppRoot(
                     onPrint = { documentToPrint = activeViewerDocument },
                     onToggleOriginalEnhanced = { useEnhanced ->
                         viewModel.toggleSavedScanEnhancement(activeViewerDocument, useEnhanced)
+                    },
+                    onSwitchScanFilterMode = { filterMode ->
+                        viewModel.toggleSavedScanEnhancement(
+                            document = activeViewerDocument,
+                            useEnhanced = filterMode != com.example.domain.model.ScanFilterMode.ORIGINAL,
+                            filterMode = filterMode
+                        )
                     },
                     onPagePositionChanged = { pageIdx ->
                         viewModel.updateLastOpenedPage(activeViewerDocument.id, pageIdx)
@@ -567,6 +619,7 @@ fun PaperworkAppRoot(
                                                 activeViewerDocId = createdDoc.id
                                             }
                                         },
+                                        onCancelConversion = { viewModel.cancelConversionJob() },
                                         onLaunchScanner = {
                                             viewModel.startNewScanSession()
                                             isScannerStudioOpen = true
@@ -598,16 +651,25 @@ fun PaperworkAppRoot(
                                 PrimaryDestination.SETTINGS -> {
                                     SettingsScreen(
                                         preferences = preferences,
+                                        keystoreSecurityLevel = keystoreSecurityLevel,
+                                        vaultKeyState = vaultKeyState,
+                                        activeKeyVersion = viewModel.cryptoManager.getCurrentKeyVersion(),
+                                        biometricAvailable = biometricAvailable,
                                         vaultStorageBytes = vaultStorageBytes,
                                         documentCount = allDocuments.size,
+                                        unreadableDocumentCount = unreadableCount,
                                         onThemeChange = { viewModel.setThemePreference(it) },
                                         onDefaultQualityChange = { viewModel.setDefaultPdfQuality(it) },
                                         onDefaultPageSizeChange = { viewModel.setDefaultPageSize(it) },
                                         onDefaultPrintOrderChange = { viewModel.setDefaultPrintOrder(it) },
                                         onDefaultEnhancedScanChange = { viewModel.setDefaultEnhancedScan(it) },
+                                        onBiometricUnlockChange = { viewModel.setBiometricUnlockEnabled(it) },
                                         onConfigurePin = { viewModel.setOrUpdatePin(it) },
                                         onDisablePin = { viewModel.disablePinLock() },
                                         onLockVaultNow = { viewModel.lockSessionNow() },
+                                        onCreateReplacementKeyAfterInvalidation = { purgeOld ->
+                                            viewModel.createReplacementKeyAfterInvalidation(purgeOld)
+                                        },
                                         onPurgeTempCache = { viewModel.purgeTemporaryDecryptedCache() }
                                     )
                                 }

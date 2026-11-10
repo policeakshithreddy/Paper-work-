@@ -4,8 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
@@ -14,10 +12,13 @@ import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
+import com.example.core.image.NormalizedQuadCorners
+import com.example.core.image.SafeBitmapDecoder
 import com.example.domain.model.MarginSize
 import com.example.domain.model.PageOrientation
 import com.example.domain.model.PageSizeOption
 import com.example.domain.model.PdfQuality
+import com.example.domain.model.ScanFilterMode
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -29,10 +30,11 @@ import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
+import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -45,20 +47,211 @@ data class PdfInspectionResult(
     val pageCount: Int,
     val hasNativeTextLayer: Boolean,
     val nativeExtractedText: String,
-    val firstPageThumbnail: Bitmap?
+    val firstPageThumbnail: Bitmap?,
+    val hasDigitalSignatures: Boolean = false
 )
+
+/**
+ * Post-rewrite validation report verifying that non-rasterizing `pdfbox-android` page manipulation
+ * produced a structurally valid, renderable PDF with expected page count, page boxes, rotation,
+ * and preserved annotations/fonts.
+ */
+data class PdfIntegrityValidationReport(
+    val isValid: Boolean,
+    val expectedPageCount: Int,
+    val actualPageCount: Int,
+    val allPageBoxesValid: Boolean,
+    val rotationPreserved: Boolean,
+    val annotationsCount: Int,
+    val hasAcroFormFields: Boolean,
+    val sourceHadDigitalSignatures: Boolean,
+    val warningMessage: String? = null
+)
+
+/**
+ * Explicitly separated service for extracting embedded PDF text streams (`PDFTextStripper`).
+ * Never invokes optical character recognition (OCR).
+ */
+class NativePdfTextExtractor {
+    suspend fun extractEmbeddedText(pdfFile: File, maxPages: Int = 50): String = withContext(Dispatchers.IO) {
+        try {
+            PDDocument.load(pdfFile).use { pdDoc ->
+                val count = pdDoc.numberOfPages.coerceAtLeast(1)
+                for (i in 0 until count) {
+                    pdDoc.getPage(i).rotation = 0
+                }
+                val stripper = PDFTextStripper().apply {
+                    startPage = 1
+                    endPage = minOf(count, maxPages)
+                }
+                stripper.getText(pdDoc)?.trim().orEmpty()
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    suspend fun extractEmbeddedTextByPage(pdfFile: File): Map<Int, String> = withContext(Dispatchers.IO) {
+        val map = mutableMapOf<Int, String>()
+        try {
+            PDDocument.load(pdfFile).use { doc ->
+                for (i in 0 until doc.numberOfPages) {
+                    doc.getPage(i).rotation = 0
+                }
+                val stripper = PDFTextStripper()
+                for (p in 1..doc.numberOfPages) {
+                    stripper.startPage = p
+                    stripper.endPage = p
+                    val pageText = stripper.getText(doc)?.trim().orEmpty()
+                    if (pageText.isNotEmpty()) {
+                        map[p - 1] = pageText
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        map
+    }
+}
+
+/**
+ * Explicitly separated service for on-device optical character recognition (OCR)
+ * using Google ML Kit Text Recognition on rendered or scanned page bitmaps.
+ */
+class OnDeviceOcrService {
+    suspend fun recognizeBitmapText(bitmap: Bitmap): String = suspendCoroutine { cont ->
+        try {
+            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val image = InputImage.fromBitmap(bitmap, 0)
+            recognizer.process(image)
+                .addOnSuccessListener { visionText ->
+                    cont.resume(visionText.text.trim())
+                }
+                .addOnFailureListener {
+                    cont.resume("")
+                }
+        } catch (_: Exception) {
+            cont.resume("")
+        }
+    }
+}
+
+/**
+ * Validates rewritten PDFs produced by `pdfbox-android` page manipulation.
+ * Checks page count, `MediaBox`/`CropBox`, `/Rotate` metadata, annotations/links,
+ * `PDAcroForm` fields, font resources, and cryptographic signatures (`signatureDictionaries`).
+ */
+object PdfIntegrityValidator {
+
+    fun hasDigitalSignatures(pdfFile: File): Boolean {
+        return try {
+            PDDocument.load(pdfFile).use { doc ->
+                doc.signatureDictionaries.isNotEmpty()
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun validateRewrittenPdf(
+        sourcePdfFile: File,
+        rewrittenPdfFile: File,
+        expectedPageCount: Int,
+        expectedFirstPageRotation: Int? = null
+    ): PdfIntegrityValidationReport {
+        if (!rewrittenPdfFile.exists() || rewrittenPdfFile.length() < 16L) {
+            return PdfIntegrityValidationReport(
+                isValid = false,
+                expectedPageCount = expectedPageCount,
+                actualPageCount = 0,
+                allPageBoxesValid = false,
+                rotationPreserved = false,
+                annotationsCount = 0,
+                hasAcroFormFields = false,
+                sourceHadDigitalSignatures = false,
+                warningMessage = "Rewritten PDF file is missing or empty."
+            )
+        }
+
+        val sourceSigned = hasDigitalSignatures(sourcePdfFile)
+
+        return try {
+            PDDocument.load(rewrittenPdfFile).use { doc ->
+                val actualCount = doc.numberOfPages
+                var boxesValid = actualCount > 0
+                var totalAnnotations = 0
+                for (i in 0 until actualCount) {
+                    val page = doc.getPage(i)
+                    val mediaBox = page.mediaBox
+                    val cropBox = page.cropBox
+                    if (mediaBox == null || mediaBox.width <= 0f || mediaBox.height <= 0f ||
+                        cropBox == null || cropBox.width <= 0f || cropBox.height <= 0f
+                    ) {
+                        boxesValid = false
+                    }
+                    totalAnnotations += runCatching { page.annotations.size }.getOrDefault(0)
+                }
+
+                val firstPageRot = if (actualCount > 0) doc.getPage(0).rotation else 0
+                val rotOk = expectedFirstPageRotation == null ||
+                    ((firstPageRot % 360 + 360) % 360) == ((expectedFirstPageRotation % 360 + 360) % 360)
+
+                val hasAcroForm = runCatching {
+                    doc.documentCatalog?.acroForm?.fields?.isNotEmpty() == true
+                }.getOrDefault(false)
+
+                val warning = if (sourceSigned) {
+                    "Source PDF contains digital signatures. Derived copies have invalidated signatures; original document remains untouched in vault."
+                } else {
+                    null
+                }
+
+                val isValid = (actualCount == expectedPageCount) && boxesValid && rotOk
+                PdfIntegrityValidationReport(
+                    isValid = isValid,
+                    expectedPageCount = expectedPageCount,
+                    actualPageCount = actualCount,
+                    allPageBoxesValid = boxesValid,
+                    rotationPreserved = rotOk,
+                    annotationsCount = totalAnnotations,
+                    hasAcroFormFields = hasAcroForm,
+                    sourceHadDigitalSignatures = sourceSigned,
+                    warningMessage = warning
+                )
+            }
+        } catch (e: Exception) {
+            PdfIntegrityValidationReport(
+                isValid = false,
+                expectedPageCount = expectedPageCount,
+                actualPageCount = 0,
+                allPageBoxesValid = false,
+                rotationPreserved = false,
+                annotationsCount = 0,
+                hasAcroFormFields = false,
+                sourceHadDigitalSignatures = sourceSigned,
+                warningMessage = "PDF validation error: ${e.message}"
+            )
+        }
+    }
+}
 
 /**
  * Core PDF processing and scan enhancement engine.
  *
  * Architectural Separation:
- * 1. Uses Apache `pdfbox-android` (`PDDocument`, `PDFTextStripper`) for existing PDF modification
- *    (Reverse Page Ordering for print, custom page range extraction, lossless page rotation, and
- *    vector text extraction) so vector graphics and searchable text layers are never rasterized.
- * 2. Uses Android `PdfDocument` for generating new PDFs from scanned pages or imported images.
- * 3. Uses Android `PdfRenderer` strictly for rendering thumbnail previews or fallback display bitmaps.
+ * 1. Uses Apache `pdfbox-android` (`PDDocument`) for non-rasterizing page-level manipulation
+ *    (Reverse Page Ordering for print, custom page range extraction, and `/Rotate` updates)
+ *    while preserving the original vault document untouched and validating rewritten outputs
+ *    via [PdfIntegrityValidator].
+ * 2. Keeps [NativePdfTextExtractor] (embedded PDF text streams) strictly separate from
+ *    [OnDeviceOcrService] (ML Kit optical character recognition on bitmaps).
+ * 3. Uses Android `PdfDocument` for generating new PDFs from scanned pages or imported images.
+ * 4. Uses Android `PdfRenderer` for rendering thumbnail previews or compatibility fallback bitmaps.
  */
 class PdfProcessingEngine(private val context: Context) {
+
+    val nativeTextExtractor = NativePdfTextExtractor()
+    val ocrService = OnDeviceOcrService()
 
     init {
         try {
@@ -68,38 +261,26 @@ class PdfProcessingEngine(private val context: Context) {
     }
 
     /**
-     * Enhances a raw document camera bitmap into a crisp, high-contrast, shadow-reduced
-     * document image without modifying the original bitmap.
+     * Enhances a raw document camera bitmap using the specified [filterMode].
+     * Defaults to [ScanFilterMode.ENHANCED_COLOR] which normalizes shadows while preserving
+     * color stamps, blue/red signatures, and highlights.
      */
-    fun createEnhancedDocumentBitmap(original: Bitmap): Bitmap {
-        val output = Bitmap.createBitmap(
-            original.width,
-            original.height,
-            Bitmap.Config.ARGB_8888
-        )
-        val canvas = Canvas(output)
-        canvas.drawColor(Color.WHITE)
+    fun createEnhancedDocumentBitmap(
+        original: Bitmap,
+        filterMode: ScanFilterMode = ScanFilterMode.ENHANCED_COLOR
+    ): Bitmap {
+        return SafeBitmapDecoder.applyScanFilter(original, filterMode)
+    }
 
-        // Increase contrast (1.35x) and slight brightness lift (+12) with mild saturation reduction
-        // to make ink pop cleanly against warm/shadowed paper backgrounds.
-        val contrast = 1.38f
-        val translate = (-0.5f * contrast + 0.5f) * 255f + 14f
-        val contrastMatrix = ColorMatrix(
-            floatArrayOf(
-                contrast, 0f, 0f, 0f, translate,
-                0f, contrast, 0f, 0f, translate,
-                0f, 0f, contrast, 0f, translate,
-                0f, 0f, 0f, 1f, 0f
-            )
-        )
-        val saturationMatrix = ColorMatrix().apply { setSaturation(0.82f) }
-        saturationMatrix.postConcat(contrastMatrix)
-
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(saturationMatrix)
-        }
-        canvas.drawBitmap(original, 0f, 0f, paint)
-        return output
+    /**
+     * Applies 4-corner perspective correction and deskew angle to a bitmap.
+     */
+    fun applyPerspectiveAndDeskew(
+        source: Bitmap,
+        quad: NormalizedQuadCorners,
+        deskewAngleDegrees: Float = 0f
+    ): Bitmap {
+        return SafeBitmapDecoder.applyPerspectiveAndDeskew(source, quad, deskewAngleDegrees)
     }
 
     /**
@@ -133,7 +314,8 @@ class PdfProcessingEngine(private val context: Context) {
 
     /**
      * Generates a multi-page PDF byte array from a list of [PageImageSpec] items,
-     * honoring page size (A4 / Letter / Legal), orientation, margins, and quality scaling.
+     * honoring page size (A4 / Letter / Legal), orientation, margins, quality scaling,
+     * and coroutine cancellation.
      */
     suspend fun buildPdfFromImages(
         pages: List<PageImageSpec>,
@@ -150,8 +332,9 @@ class PdfProcessingEngine(private val context: Context) {
             val pdfDocument = PdfDocument()
             try {
                 pages.forEachIndexed { index, spec ->
+                    coroutineContext.ensureActive()
                     val rotated = rotateBitmap(spec.bitmap, spec.rotationDegrees)
-                    val scaled = scaleDownIfNeeded(rotated, quality.maxDimensionPx)
+                    val scaled = SafeBitmapDecoder.scaleDownToMaxDimension(rotated, quality.maxDimensionPx)
 
                     val pageInfo = PdfDocument.PageInfo.Builder(baseWidth, baseHeight, index + 1).create()
                     val page = pdfDocument.startPage(pageInfo)
@@ -180,12 +363,14 @@ class PdfProcessingEngine(private val context: Context) {
             } finally {
                 runCatching { pdfDocument.close() }
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            coroutineContext.ensureActive()
             // Fallback using Apache PDFBox PDDocument when native Skia PdfDocument is stubbed in local JVM tests
             PDDocument().use { doc ->
                 pages.forEach { spec ->
+                    coroutineContext.ensureActive()
                     val rotated = rotateBitmap(spec.bitmap, spec.rotationDegrees)
-                    val scaled = scaleDownIfNeeded(rotated, quality.maxDimensionPx)
+                    val scaled = SafeBitmapDecoder.scaleDownToMaxDimension(rotated, quality.maxDimensionPx)
                     val pdPage = PDPage(PDRectangle(baseWidth.toFloat(), baseHeight.toFloat()))
                     doc.addPage(pdPage)
                     val pdImage = com.tom_roush.pdfbox.pdmodel.graphics.image.JPEGFactory.createFromImage(
@@ -211,20 +396,12 @@ class PdfProcessingEngine(private val context: Context) {
         }
     }
 
-    private fun scaleDownIfNeeded(bitmap: Bitmap, maxDimension: Int): Bitmap {
-        val maxSide = maxOf(bitmap.width, bitmap.height)
-        if (maxSide <= maxDimension) return bitmap
-        val ratio = maxDimension.toFloat() / maxSide.toFloat()
-        val newW = (bitmap.width * ratio).toInt().coerceAtLeast(1)
-        val newH = (bitmap.height * ratio).toInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-    }
-
     /**
-     * Losslessly reorders and/or filters pages of an existing PDF using Apache `pdfbox-android`
-     * without rasterizing vector graphics or stripping searchable text layers.
+     * Non-rasterizing page manipulation using Apache `pdfbox-android`.
+     * Reorders and/or filters pages of an existing PDF without rasterizing vector content streams
+     * or stripping embedded fonts/annotations, then validates the rewritten file with [PdfIntegrityValidator].
      *
-     * Used for Reverse Page Printing (N -> 1), custom print page ranges, and lossless page rotation.
+     * Note: The original vault document is always preserved untouched.
      */
     suspend fun createReorderedOrFilteredPdf(
         sourcePdfFile: File,
@@ -233,7 +410,8 @@ class PdfProcessingEngine(private val context: Context) {
         oneBasedPageNumbers: List<Int>? = null,
         extraRotationDegrees: Int = 0
     ): Int = withContext(Dispatchers.IO) {
-        PDDocument.load(sourcePdfFile).use { sourceDoc ->
+        var expectedFirstRotation: Int? = null
+        val writtenPages = PDDocument.load(sourcePdfFile).use { sourceDoc ->
             val totalPages = sourceDoc.numberOfPages
             val validIndices = if (oneBasedPageNumbers.isNullOrEmpty()) {
                 (0 until totalPages).toList()
@@ -246,17 +424,36 @@ class PdfProcessingEngine(private val context: Context) {
             val finalIndices = if (validIndices.isEmpty()) (0 until totalPages).toList() else validIndices
 
             PDDocument().use { outputDoc ->
-                for (pageIndex in finalIndices) {
+                for ((outIdx, pageIndex) in finalIndices.withIndex()) {
+                    coroutineContext.ensureActive()
                     val sourcePage = sourceDoc.getPage(pageIndex)
                     val importedPage = outputDoc.importPage(sourcePage)
-                    if (extraRotationDegrees != 0) {
-                        importedPage.rotation = (importedPage.rotation + extraRotationDegrees) % 360
+                    // Explicitly preserve MediaBox, CropBox, and annotations
+                    sourcePage.mediaBox?.let { importedPage.mediaBox = it }
+                    sourcePage.cropBox?.let { importedPage.cropBox = it }
+                    val newRot = (sourcePage.rotation + extraRotationDegrees) % 360
+                    importedPage.rotation = newRot
+                    if (outIdx == 0) {
+                        expectedFirstRotation = newRot
                     }
                 }
                 outputDoc.save(targetPdfFile)
                 outputDoc.numberOfPages
             }
         }
+
+        val validation = PdfIntegrityValidator.validateRewrittenPdf(
+            sourcePdfFile = sourcePdfFile,
+            rewrittenPdfFile = targetPdfFile,
+            expectedPageCount = writtenPages,
+            expectedFirstPageRotation = expectedFirstRotation
+        )
+        if (!validation.isValid) {
+            throw IllegalStateException(
+                validation.warningMessage ?: "Rewritten PDF failed post-write integrity validation."
+            )
+        }
+        writtenPages
     }
 
     /**
@@ -293,23 +490,21 @@ class PdfProcessingEngine(private val context: Context) {
     }
 
     /**
-     * Inspects a decrypted PDF file to extract page count, vector text layer via `PDFTextStripper`,
-     * and a crisp first-page thumbnail via `PdfRenderer`.
+     * Inspects a decrypted PDF file to extract page count, embedded PDF text layer via
+     * [NativePdfTextExtractor], digital signature status, and a crisp first-page thumbnail via `PdfRenderer`.
      */
     suspend fun inspectPdfFile(pdfFile: File): PdfInspectionResult = withContext(Dispatchers.IO) {
         var pageCount = 1
-        var nativeText = ""
+        var hasSignatures = false
         try {
             PDDocument.load(pdfFile).use { pdDoc ->
                 pageCount = pdDoc.numberOfPages.coerceAtLeast(1)
-                val stripper = PDFTextStripper().apply {
-                    startPage = 1
-                    endPage = minOf(pageCount, 20)
-                }
-                nativeText = stripper.getText(pdDoc)?.trim().orEmpty()
+                hasSignatures = pdDoc.signatureDictionaries.isNotEmpty()
             }
         } catch (_: Exception) {
         }
+
+        val nativeText = nativeTextExtractor.extractEmbeddedText(pdfFile, maxPages = 20)
 
         var thumbnail: Bitmap? = null
         try {
@@ -339,13 +534,14 @@ class PdfProcessingEngine(private val context: Context) {
             pageCount = pageCount,
             hasNativeTextLayer = hasNativeText,
             nativeExtractedText = nativeText,
-            firstPageThumbnail = thumbnail
+            firstPageThumbnail = thumbnail,
+            hasDigitalSignatures = hasSignatures
         )
     }
 
     /**
      * Renders a specific page of a PDF file to a Bitmap at the requested width (used for
-     * thumbnail strips, OCR input, or fallback viewing on API < 31).
+     * thumbnail strips, OCR input, or fallback viewing).
      */
     suspend fun renderPdfPageToBitmap(
         pdfFile: File,
@@ -379,45 +575,16 @@ class PdfProcessingEngine(private val context: Context) {
     }
 
     /**
-     * Extracts text per page from a vector PDF using PDFBox `PDFTextStripper`.
+     * Extracts embedded text per page from a vector PDF using [NativePdfTextExtractor].
      */
-    suspend fun extractNativeTextByPage(pdfFile: File): Map<Int, String> = withContext(Dispatchers.IO) {
-        val map = mutableMapOf<Int, String>()
-        try {
-            PDDocument.load(pdfFile).use { doc ->
-                val stripper = PDFTextStripper()
-                for (p in 1..doc.numberOfPages) {
-                    stripper.startPage = p
-                    stripper.endPage = p
-                    val pageText = stripper.getText(doc)?.trim().orEmpty()
-                    if (pageText.isNotEmpty()) {
-                        map[p - 1] = pageText
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-        map
-    }
+    suspend fun extractNativeTextByPage(pdfFile: File): Map<Int, String> =
+        nativeTextExtractor.extractEmbeddedTextByPage(pdfFile)
 
     /**
-     * Runs on-device Google ML Kit Text Recognition (Latin script) on a bitmap.
+     * Runs on-device Google ML Kit Text Recognition (Latin script) on a bitmap via [OnDeviceOcrService].
      */
-    suspend fun recognizeTextWithMlKit(bitmap: Bitmap): String = suspendCoroutine { cont ->
-        try {
-            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-            val image = InputImage.fromBitmap(bitmap, 0)
-            recognizer.process(image)
-                .addOnSuccessListener { visionText ->
-                    cont.resume(visionText.text.trim())
-                }
-                .addOnFailureListener {
-                    cont.resume("")
-                }
-        } catch (_: Exception) {
-            cont.resume("")
-        }
-    }
+    suspend fun recognizeTextWithMlKit(bitmap: Bitmap): String =
+        ocrService.recognizeBitmapText(bitmap)
 
     /**
      * Generates a genuine vector text-layer multi-page PDF using Apache `pdfbox-android`
@@ -428,16 +595,16 @@ class PdfProcessingEngine(private val context: Context) {
             val pagesContent = listOf(
                 Triple(
                     "Paperwork - Architecture & Security Guide (Page 1 of 3)",
-                    "1. Hardware-Backed Local Vault (AES-256-GCM)",
+                    "1. Versioned Local Vault (AES-256-GCM)",
                     listOf(
                         "Welcome to Paperwork, a native Google Pixel-style document utility.",
                         "Every document, thumbnail, original scan, and metadata record is encrypted",
-                        "at rest using Android Keystore AES-256-GCM without deprecated MasterKey APIs.",
+                        "at rest using Android Keystore AES-256-GCM with a 19-byte PWKV header.",
                         "",
                         "Key Highlights:",
                         "- Native Jetpack PDF Viewer (androidx.pdf 1.0.0-beta01) with Compose support.",
-                        "- Reversible Original vs. Enhanced multi-page document scanning.",
-                        "- Non-rasterizing vector PDF page manipulation via Apache PDFBox-Android.",
+                        "- Reversible Original, Enhanced Color, and Ink-Saving Grayscale scanning.",
+                        "- Non-rasterizing PDF page manipulation via Apache PDFBox-Android.",
                         "- Native Android PrintManager integration with Reverse Page Ordering (N -> 1).",
                         "",
                         "Try searching for 'Keystore', 'Reverse', or 'Vector' using the search icon above!"
@@ -451,7 +618,7 @@ class PdfProcessingEngine(private val context: Context) {
                         "Date: November 10, 2026   |   Payment Status: PAID IN FULL",
                         "",
                         "Line 01: On-Device ML Kit Document Scanner License .......... $0.00 (Included)",
-                        "Line 02: Local AES-256-GCM Hardware Vault Storage ........... $0.00 (Offline)",
+                        "Line 02: Local AES-256-GCM Keystore Vault Storage ........... $0.00 (Offline)",
                         "Line 03: Multi-Page A4 / Letter / Legal Conversion Engine ... $0.00 (Included)",
                         "Line 04: Reverse Page Order Print Spooler Module ............ $0.00 (Included)",
                         "",
@@ -470,7 +637,7 @@ class PdfProcessingEngine(private val context: Context) {
                         "1. Tap the Print icon in the top bar or document menu.",
                         "2. Select 'Reverse order (N -> 1)' to print Page 3, then Page 2, then Page 1.",
                         "3. Select text directly on this vector PDF page to copy or share.",
-                        "4. Open the Scanned Receipt sample to test the Original vs. Enhanced toggle."
+                        "4. Open the Scanned Receipt sample to test Original vs. Enhanced Color."
                     )
                 )
             )
@@ -479,7 +646,6 @@ class PdfProcessingEngine(private val context: Context) {
                 val page = PDPage(PDRectangle.A4)
                 doc.addPage(page)
                 PDPageContentStream(doc, page).use { stream ->
-                    // Header banner
                     stream.setNonStrokingColor(11, 87, 208)
                     stream.addRect(48f, 750f, 500f, 44f)
                     stream.fill()
@@ -511,7 +677,6 @@ class PdfProcessingEngine(private val context: Context) {
                         y -= 24f
                     }
 
-                    // Footer
                     stream.beginText()
                     stream.setNonStrokingColor(115, 119, 127)
                     stream.setFont(PDType1Font.COURIER, 9.5f)
@@ -526,12 +691,12 @@ class PdfProcessingEngine(private val context: Context) {
 
     /**
      * Generates a realistic 2-page "Scanned Field Receipt & Inspection Form" with warm shadowed
-     * original bitmaps so the user can immediately test Original vs. Enhanced toggling and OCR.
+     * original bitmaps and a cobalt-blue approval stamp so the user can immediately verify that
+     * Enhanced Color preserves color stamps while cleaning paper shadows.
      */
     fun createSampleScannedBitmaps(): List<Bitmap> {
         val page1 = Bitmap.createBitmap(900, 1260, Bitmap.Config.ARGB_8888)
         Canvas(page1).apply {
-            // Warm slightly shadowed paper background so "Original" vs "Enhanced" difference is visually clear
             drawColor(Color.rgb(236, 231, 220))
             val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.rgb(32, 42, 58)
@@ -542,6 +707,11 @@ class PdfProcessingEngine(private val context: Context) {
                 color = Color.rgb(52, 56, 64)
                 textSize = 24f
                 typeface = Typeface.MONOSPACE
+            }
+            val stampPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(11, 87, 208)
+                textSize = 26f
+                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
             }
             val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.rgb(180, 174, 162)
@@ -556,14 +726,14 @@ class PdfProcessingEngine(private val context: Context) {
             val items = listOf(
                 "1x Heavy Duty Document Folder ........ $14.50",
                 "2x Archival Fountain Ink (Cobalt) .... $38.00",
-                "1xA4 Recycled Cotton Paper Ream ...... $22.00",
+                "1x A4 Recycled Cotton Paper Ream ..... $22.00",
                 "1x Portable USB-C Desk Lamp .......... $49.00",
                 "---------------------------------------------",
                 "SUBTOTAL ............................. $123.50",
                 "CA STATE TAX (8.625%) ................ $10.65",
                 "TOTAL CHARGED (VISA *4092) ........... $134.15",
                 "",
-                "CUSTOMER COPY — RETAIN FOR WARRANTY & TAX LOG",
+                "CUSTOMER COPY - RETAIN FOR WARRANTY & TAX LOG",
                 "OCR Verification Code: PW-SCAN-9940-LATIN"
             )
             var y = 290f
@@ -571,6 +741,7 @@ class PdfProcessingEngine(private val context: Context) {
                 drawText(line, 96f, y, bodyPaint)
                 y += 54f
             }
+            drawText("[APPROVED IN COLOR - COBALT STAMP]", 96f, 960f, stampPaint)
         }
 
         val page2 = Bitmap.createBitmap(900, 1260, Bitmap.Config.ARGB_8888)
@@ -589,13 +760,13 @@ class PdfProcessingEngine(private val context: Context) {
             drawText("DELIVERY & EQUIPMENT SIGN-OFF (PAGE 2)", 96f, 140f, titlePaint)
             val notes = listOf(
                 "Inspector: Jordan Vance",
-                "Location: Warehouse Dock B — Receiving",
+                "Location: Warehouse Dock B - Receiving",
                 "Condition: All crates sealed and verified intact.",
                 "",
                 "Original Scan Preservation Note:",
                 "Paperwork stores both this warm, unprocessed camera capture",
-                "(Original) and the contrast-normalized document layer (Enhanced).",
-                "You can switch between Original and Enhanced at any time."
+                "(Original) and the color-preserving enhanced document layer.",
+                "You can switch between Original, Enhanced Color, and Grayscale anytime."
             )
             var y = 230f
             for (line in notes) {

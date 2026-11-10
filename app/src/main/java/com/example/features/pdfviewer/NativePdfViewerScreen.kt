@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
-import android.net.Uri
 import android.os.Build
 import android.os.ext.SdkExtensions
 import androidx.activity.compose.BackHandler
@@ -50,7 +49,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -63,6 +61,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -95,24 +94,38 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import android.view.View
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.fragment.app.FragmentActivity
+import androidx.fragment.app.FragmentContainerView
 import androidx.pdf.ExperimentalPdfApi
 import androidx.pdf.PdfDocument
 import androidx.pdf.SandboxedPdfLoader
-import androidx.pdf.compose.PdfViewer
-import androidx.pdf.compose.PdfViewerState
+import androidx.pdf.viewer.fragment.PdfViewerFragment
+import com.example.core.pdf.DecryptedPdfSessionHandle
 import com.example.core.pdf.PdfProcessingEngine
 import com.example.core.security.VaultCryptoManager
 import com.example.data.repository.DocumentRepository
+import com.example.domain.model.DocumentEncryptionStatus
 import com.example.domain.model.PaperworkDocument
+import com.example.domain.model.ScanFilterMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 
 /**
- * Checks whether the current Android runtime supports the official Jetpack `androidx.pdf`
- * sandboxed PDF service (Android 15+ natively, or Android 12+ with SdkExtensions R >= 13).
+ * Runtime capability checker and engine selector for the PDF viewer.
+ *
+ * Official `androidx.pdf:1.0.0-beta01` (`SandboxedPdfLoader` + `PdfDocumentService`)
+ * requires Android 15 (API 35+) or Android 12–14 with `SdkExtensions.getExtensionVersion(R) >= 13`.
+ * On API 28–30 or devices without the required SDK extension, Paperwork automatically routes
+ * to [PdfViewerEngine.FRAMEWORK_PDF_RENDERER].
  */
+enum class PdfViewerEngine(val label: String) {
+    JETPACK_SANDBOXED_PDF("Official AndroidX PdfViewer (Sandboxed)"),
+    FRAMEWORK_PDF_RENDERER("Android PdfRenderer Compatibility Engine")
+}
+
 object PdfViewerCapabilityChecker {
     fun isJetpackPdfSupported(): Boolean {
         return try {
@@ -125,6 +138,14 @@ object PdfViewerCapabilityChecker {
             }
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    fun selectDefaultEngine(): PdfViewerEngine {
+        return if (isJetpackPdfSupported()) {
+            PdfViewerEngine.JETPACK_SANDBOXED_PDF
+        } else {
+            PdfViewerEngine.FRAMEWORK_PDF_RENDERER
         }
     }
 }
@@ -141,6 +162,9 @@ fun NativePdfViewerScreen(
     onExportToSaf: () -> Unit,
     onPrint: () -> Unit,
     onToggleOriginalEnhanced: (Boolean) -> Unit,
+    onSwitchScanFilterMode: (ScanFilterMode) -> Unit = { mode ->
+        onToggleOriginalEnhanced(mode != ScanFilterMode.ORIGINAL)
+    },
     onPagePositionChanged: (Int) -> Unit,
     onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -150,13 +174,16 @@ fun NativePdfViewerScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var decryptedTempFile by remember(document.id, document.modifiedAt) { mutableStateOf<File?>(null) }
+    // Controlled Decryption Session Handle:
+    // Encrypted Vault File -> Controlled Decryption -> DecryptedPdfSessionHandle -> Viewer Engine -> Deterministic Cleanup
+    var activeSessionHandle by remember(document.id, document.modifiedAt) {
+        mutableStateOf<DecryptedPdfSessionHandle?>(null)
+    }
     var isLoadingFile by remember(document.id, document.modifiedAt) { mutableStateOf(true) }
     var loadError by remember(document.id, document.modifiedAt) { mutableStateOf<String?>(null) }
 
-    // Official Jetpack PDF Viewer vs. Compatibility Fallback toggle
     val jetpackPdfSupported = remember { PdfViewerCapabilityChecker.isJetpackPdfSupported() }
-    var preferJetpackComposeViewer by remember { mutableStateOf(jetpackPdfSupported) }
+    var activeEngine by remember { mutableStateOf(PdfViewerCapabilityChecker.selectDefaultEngine()) }
 
     // Search & Selectable Text / OCR Inspection state
     var isSearchBarVisible by remember { mutableStateOf(false) }
@@ -165,72 +192,77 @@ fun NativePdfViewerScreen(
     var isRunningOnDemandOcr by remember { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
 
-    // Page-indexed text map (0-based pageIndex -> text)
-    val pageTextMap = remember(document.id, document.modifiedAt) { mutableStateMapOf<Int, String>() }
-    var isOcrDerivedText by remember(document.id, document.modifiedAt) {
+    // Strictly separate Embedded PDF Text Layer vs. ML Kit OCR Text maps (0-based pageIndex -> text)
+    val embeddedPdfTextByPage = remember(document.id, document.modifiedAt) { mutableStateMapOf<Int, String>() }
+    val ocrRecognizedTextByPage = remember(document.id, document.modifiedAt) { mutableStateMapOf<Int, String>() }
+    var inspectOcrTabInSheet by remember(document.id, document.modifiedAt) {
         mutableStateOf(!document.hasNativeTextLayer)
     }
 
-    // Current page & zoom state for bottom pill and fallback viewer
     var currentPageIndex by remember(document.id) {
         mutableIntStateOf(document.lastOpenedPage.coerceIn(0, (document.pageCount - 1).coerceAtLeast(0)))
     }
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
 
-    // Decrypt PDF to isolated session cache on entry, and securely wipe on exit
+    // Deterministic cleanup of DecryptedPdfSessionHandle on viewer exit or document reload
     DisposableEffect(document.id, document.modifiedAt) {
         onDispose {
-            decryptedTempFile?.let { cryptoManager.secureDeleteFile(it) }
+            activeSessionHandle?.close()
+            activeSessionHandle = null
         }
     }
 
     LaunchedEffect(document.id, document.modifiedAt) {
         isLoadingFile = true
         loadError = null
-        withContext(Dispatchers.IO) {
-            try {
-                val encFile = File(document.encryptedPdfPath)
-                if (!encFile.exists()) {
-                    loadError = "Encrypted PDF file not found in vault."
-                    isLoadingFile = false
-                    return@withContext
-                }
-                val temp = cryptoManager.materializeDecryptedTempFile(
-                    sourceEncryptedFile = encFile,
-                    tempFileName = "viewer_${document.id}_${document.modifiedAt}.pdf",
-                    aad = document.id
-                )
-                decryptedTempFile = temp
+        if (document.encryptionStatus == DocumentEncryptionStatus.UNREADABLE_KEY_INVALIDATED) {
+            loadError = "This document was encrypted with an older Android Keystore key (v${document.keyVersion}) that was permanently invalidated by the OS."
+            isLoadingFile = false
+            return@LaunchedEffect
+        }
 
-                // Populate native text layer per page via PDFBox if available
-                val extractedByPage = pdfEngine.extractNativeTextByPage(temp)
-                if (extractedByPage.isNotEmpty()) {
-                    pageTextMap.clear()
-                    pageTextMap.putAll(extractedByPage)
-                    isOcrDerivedText = false
-                } else if (document.extractedOcrText.isNotBlank()) {
-                    pageTextMap.clear()
-                    pageTextMap[0] = document.extractedOcrText
-                    isOcrDerivedText = true
+        withContext(Dispatchers.IO) {
+            val sessionResult = repository.secureDocumentAccessManager.openDecryptedSession(
+                document = document,
+                purpose = "viewer"
+            )
+            sessionResult.fold(
+                onSuccess = { handle ->
+                    activeSessionHandle = handle
+                    // Extract embedded PDF text stream per page via NativePdfTextExtractor (never OCR)
+                    val embeddedMap = pdfEngine.nativeTextExtractor.extractEmbeddedTextByPage(handle.decryptedFile)
+                    embeddedPdfTextByPage.clear()
+                    embeddedPdfTextByPage.putAll(embeddedMap)
+
+                    ocrRecognizedTextByPage.clear()
+                    if (document.ocrRecognizedText.isNotBlank()) {
+                        ocrRecognizedTextByPage[0] = document.ocrRecognizedText
+                    }
+                    inspectOcrTabInSheet = embeddedMap.isEmpty()
+                    isLoadingFile = false
+                },
+                onFailure = { err ->
+                    loadError = err.message ?: "Failed to decrypt PDF for viewing."
+                    isLoadingFile = false
                 }
-                isLoadingFile = false
-            } catch (e: Exception) {
-                loadError = e.message ?: "Failed to decrypt PDF for viewing."
-                isLoadingFile = false
-            }
+            )
         }
     }
 
-    val matchingPages by remember(searchQuery, pageTextMap.size) {
+    val matchingPages by remember(searchQuery, embeddedPdfTextByPage.size, ocrRecognizedTextByPage.size) {
         derivedStateOf {
             if (searchQuery.isBlank()) {
                 emptyList()
             } else {
-                pageTextMap.entries
-                    .filter { it.value.contains(searchQuery, ignoreCase = true) }
-                    .map { it.key }
-                    .sorted()
+                val pages = mutableSetOf<Int>()
+                embeddedPdfTextByPage.forEach { (idx, txt) ->
+                    if (txt.contains(searchQuery, ignoreCase = true)) pages.add(idx)
+                }
+                ocrRecognizedTextByPage.forEach { (idx, txt) ->
+                    if (txt.contains(searchQuery, ignoreCase = true)) pages.add(idx)
+                }
+                pages.sorted()
             }
         }
     }
@@ -268,9 +300,9 @@ fun NativePdfViewerScreen(
                             ) {
                                 Text(
                                     text = if (document.hasNativeTextLayer) {
-                                        "Native PDF Text Layer"
+                                        "Embedded PDF Text Layer • Key v${document.keyVersion}"
                                     } else {
-                                        "Scanned PDF • ML Kit OCR Ready"
+                                        "Scanned PDF • On-Device OCR Ready • Key v${document.keyVersion}"
                                     },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary
@@ -297,7 +329,7 @@ fun NativePdfViewerScreen(
                             onClick = { showTextAndOcrSheet = true },
                             modifier = Modifier.testTag("viewer_text_ocr_button")
                         ) {
-                            Icon(Icons.Default.TextSnippet, contentDescription = "Select text & OCR")
+                            Icon(Icons.Default.TextSnippet, contentDescription = "Embedded text & OCR")
                         }
                         IconButton(
                             onClick = onPrint,
@@ -318,7 +350,7 @@ fun NativePdfViewerScreen(
                                 onDismissRequest = { menuExpanded = false }
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("Select & copy text / OCR") },
+                                    text = { Text("Embedded Text & ML Kit OCR") },
                                     leadingIcon = { Icon(Icons.Default.TextSnippet, contentDescription = null) },
                                     onClick = {
                                         menuExpanded = false
@@ -326,20 +358,18 @@ fun NativePdfViewerScreen(
                                     }
                                 )
                                 if (document.scanPages.isNotEmpty()) {
-                                    val nextEnhanced = !document.currentlyUsingEnhanced
-                                    DropdownMenuItem(
-                                        text = {
-                                            Text(
-                                                if (nextEnhanced) "Switch to Enhanced scan"
-                                                else "Switch to Original scan"
+                                    ScanFilterMode.entries.forEach { mode ->
+                                        if (mode != document.activeScanFilterMode) {
+                                            DropdownMenuItem(
+                                                text = { Text("Switch to ${mode.label}") },
+                                                leadingIcon = { Icon(Icons.Default.AutoFixHigh, contentDescription = null) },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    onSwitchScanFilterMode(mode)
+                                                }
                                             )
-                                        },
-                                        leadingIcon = { Icon(Icons.Default.AutoFixHigh, contentDescription = null) },
-                                        onClick = {
-                                            menuExpanded = false
-                                            onToggleOriginalEnhanced(nextEnhanced)
                                         }
-                                    )
+                                    }
                                 }
                                 DropdownMenuItem(
                                     text = { Text("Share PDF") },
@@ -369,13 +399,20 @@ fun NativePdfViewerScreen(
                                     DropdownMenuItem(
                                         text = {
                                             Text(
-                                                if (preferJetpackComposeViewer) "Use Page-by-Page Renderer"
-                                                else "Use Jetpack PdfViewer Engine"
+                                                if (activeEngine == PdfViewerEngine.JETPACK_SANDBOXED_PDF) {
+                                                    "Switch to PdfRenderer Engine"
+                                                } else {
+                                                    "Switch to Official AndroidX PdfViewer"
+                                                }
                                             )
                                         },
                                         onClick = {
                                             menuExpanded = false
-                                            preferJetpackComposeViewer = !preferJetpackComposeViewer
+                                            activeEngine = if (activeEngine == PdfViewerEngine.JETPACK_SANDBOXED_PDF) {
+                                                PdfViewerEngine.FRAMEWORK_PDF_RENDERER
+                                            } else {
+                                                PdfViewerEngine.JETPACK_SANDBOXED_PDF
+                                            }
                                         }
                                     )
                                 }
@@ -384,7 +421,7 @@ fun NativePdfViewerScreen(
                     }
                 )
 
-                // Reversible Original / Enhanced Banner for Scanned Documents
+                // Reversible Original / Enhanced Color / Grayscale Banner for Scanned Documents
                 if (document.scanPages.isNotEmpty()) {
                     Surface(
                         color = MaterialTheme.colorScheme.surfaceContainer,
@@ -393,38 +430,37 @@ fun NativePdfViewerScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 24.dp, vertical = 8.dp),
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Scan layer:",
-                                style = MaterialTheme.typography.labelLarge
+                                text = "Scan filter:",
+                                style = MaterialTheme.typography.labelMedium
                             )
                             SingleChoiceSegmentedButtonRow(
-                                modifier = Modifier.width(220.dp)
+                                modifier = Modifier.width(280.dp)
                             ) {
-                                SegmentedButton(
-                                    selected = !document.currentlyUsingEnhanced,
-                                    onClick = {
-                                        if (document.currentlyUsingEnhanced) {
-                                            onToggleOriginalEnhanced(false)
-                                        }
-                                    },
-                                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
-                                ) {
-                                    Text("Original")
-                                }
-                                SegmentedButton(
-                                    selected = document.currentlyUsingEnhanced,
-                                    onClick = {
-                                        if (!document.currentlyUsingEnhanced) {
-                                            onToggleOriginalEnhanced(true)
-                                        }
-                                    },
-                                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
-                                ) {
-                                    Text("Enhanced")
+                                ScanFilterMode.entries.forEachIndexed { index, mode ->
+                                    val shortLabel = when (mode) {
+                                        ScanFilterMode.ORIGINAL -> "Original"
+                                        ScanFilterMode.ENHANCED_COLOR -> "Color+"
+                                        ScanFilterMode.INK_SAVING_GRAYSCALE -> "B&W"
+                                    }
+                                    SegmentedButton(
+                                        selected = document.activeScanFilterMode == mode,
+                                        onClick = {
+                                            if (document.activeScanFilterMode != mode) {
+                                                onSwitchScanFilterMode(mode)
+                                            }
+                                        },
+                                        shape = SegmentedButtonDefaults.itemShape(
+                                            index = index,
+                                            count = ScanFilterMode.entries.size
+                                        )
+                                    ) {
+                                        Text(shortLabel, style = MaterialTheme.typography.labelSmall)
+                                    }
                                 }
                             }
                         }
@@ -507,6 +543,7 @@ fun NativePdfViewerScreen(
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.surfaceContainerLowest)
         ) {
+            val session = activeSessionHandle
             when {
                 isLoadingFile -> {
                     Column(
@@ -516,7 +553,7 @@ fun NativePdfViewerScreen(
                         CircularProgressIndicator()
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Decrypting PDF stream via Android Keystore...",
+                            text = "Decrypting PDF session via Android Keystore...",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -542,19 +579,19 @@ fun NativePdfViewerScreen(
                     }
                 }
 
-                decryptedTempFile != null -> {
-                    val pdfFile = decryptedTempFile!!
+                session != null -> {
+                    var jetpackFailed by remember(session.sessionId) { mutableStateOf(false) }
 
-                    // Primary Engine: Official Jetpack `androidx.pdf:pdf-compose` (`PdfViewer` + `SandboxedPdfLoader`)
-                    var jetpackFailed by remember(pdfFile.absolutePath) { mutableStateOf(false) }
-
-                    if (preferJetpackComposeViewer && !jetpackFailed) {
+                    if (activeEngine == PdfViewerEngine.JETPACK_SANDBOXED_PDF && !jetpackFailed) {
                         JetpackOfficialComposePdfSurface(
-                            pdfFile = pdfFile,
-                            onFallbackRequired = { jetpackFailed = true }
+                            sessionHandle = session,
+                            onFallbackRequired = {
+                                jetpackFailed = true
+                                activeEngine = PdfViewerEngine.FRAMEWORK_PDF_RENDERER
+                            }
                         )
                     } else {
-                        // High-DPI Lazy Page-by-Page `PdfRenderer` Surface with Pinch-to-Zoom & Double-Tap Zoom
+                        // Tested Compatibility Fallback: Framework PdfRenderer Page-by-Page Surface
                         LazyColumn(
                             state = lazyListState,
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 20.dp),
@@ -596,13 +633,14 @@ fun NativePdfViewerScreen(
                         ) {
                             items(document.pageCount) { pageIdx ->
                                 PdfRenderedPageCard(
-                                    pdfFile = pdfFile,
+                                    sessionHandle = session,
                                     pageIndex = pageIdx,
                                     totalPages = document.pageCount,
                                     pdfEngine = pdfEngine,
                                     isSearchMatch = matchingPages.contains(pageIdx),
                                     searchQuery = searchQuery,
-                                    pageText = pageTextMap[pageIdx],
+                                    embeddedText = embeddedPdfTextByPage[pageIdx],
+                                    ocrText = ocrRecognizedTextByPage[pageIdx],
                                     onOpenTextSelect = {
                                         currentPageIndex = pageIdx
                                         showTextAndOcrSheet = true
@@ -674,10 +712,13 @@ fun NativePdfViewerScreen(
         }
     }
 
-    // Native Text Selection & On-Device ML Kit OCR Sheet
-    if (showTextAndOcrSheet && decryptedTempFile != null) {
+    // Strictly Separated Embedded PDF Text vs. On-Device ML Kit OCR Sheet
+    val sessionForSheet = activeSessionHandle
+    if (showTextAndOcrSheet && sessionForSheet != null) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-        val currentText = pageTextMap[currentPageIndex] ?: document.extractedOcrText
+        val embeddedPageText = embeddedPdfTextByPage[currentPageIndex] ?: document.nativePdfText
+        val ocrPageText = ocrRecognizedTextByPage[currentPageIndex] ?: document.ocrRecognizedText
+        val displayedText = if (inspectOcrTabInSheet) ocrPageText else embeddedPageText
 
         ModalBottomSheet(
             onDismissRequest = { showTextAndOcrSheet = false },
@@ -698,50 +739,48 @@ fun NativePdfViewerScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Selectable Text & OCR Layer",
+                            text = "Embedded PDF Text & On-Device OCR",
                             style = MaterialTheme.typography.titleLarge
                         )
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = if (isOcrDerivedText) {
-                                MaterialTheme.colorScheme.tertiaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.primaryContainer
-                            },
-                            modifier = Modifier.padding(top = 4.dp)
-                        ) {
-                            Text(
-                                text = if (isOcrDerivedText) {
-                                    "Source: On-Device ML Kit OCR (Latin script)"
-                                } else {
-                                    "Source: Original PDF Vector Text Layer"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isOcrDerivedText) {
-                                    MaterialTheme.colorScheme.onTertiaryContainer
-                                } else {
-                                    MaterialTheme.colorScheme.onPrimaryContainer
-                                },
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                            )
-                        }
+                        Text(
+                            text = "Strictly separated native PDF text extraction vs. optical character recognition",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
 
                     FilledTonalButton(
                         onClick = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            clipboard?.setPrimaryClip(ClipData.newPlainText("PDF Text", currentText))
+                            clipboard?.setPrimaryClip(ClipData.newPlainText("PDF Text", displayedText))
                             onShowMessage("Copied text to clipboard.")
                         },
-                        enabled = currentText.isNotBlank()
+                        enabled = displayedText.isNotBlank()
                     ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = null)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Copy All")
+                        Text("Copy")
                     }
                 }
 
-                // Run or Refresh On-Device ML Kit OCR for Current Page
+                // Segmented Selector: Embedded PDF Text Stream vs. On-Device ML Kit OCR
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    SegmentedButton(
+                        selected = !inspectOcrTabInSheet,
+                        onClick = { inspectOcrTabInSheet = false },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
+                    ) {
+                        Text("Embedded PDF Text")
+                    }
+                    SegmentedButton(
+                        selected = inspectOcrTabInSheet,
+                        onClick = { inspectOcrTabInSheet = true },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
+                    ) {
+                        Text("ML Kit OCR Text")
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -754,17 +793,20 @@ fun NativePdfViewerScreen(
                     )
                     Button(
                         onClick = {
-                            val file = decryptedTempFile ?: return@Button
                             scope.launch {
                                 isRunningOnDemandOcr = true
-                                val pageBmp = pdfEngine.renderPdfPageToBitmap(file, currentPageIndex, 1440)
+                                val pageBmp = pdfEngine.renderPdfPageToBitmap(
+                                    pdfFile = sessionForSheet.decryptedFile,
+                                    pageIndex = currentPageIndex,
+                                    targetWidthPx = 1440
+                                )
                                 if (pageBmp != null) {
-                                    val recognized = pdfEngine.recognizeTextWithMlKit(pageBmp)
+                                    val recognized = pdfEngine.ocrService.recognizeBitmapText(pageBmp)
                                     if (recognized.isNotBlank()) {
-                                        pageTextMap[currentPageIndex] = recognized
-                                        isOcrDerivedText = true
+                                        ocrRecognizedTextByPage[currentPageIndex] = recognized
+                                        inspectOcrTabInSheet = true
                                         repository.updateExtractedOcrText(document, recognized)
-                                        onShowMessage("OCR completed for Page ${currentPageIndex + 1}.")
+                                        onShowMessage("ML Kit OCR completed for Page ${currentPageIndex + 1}.")
                                     } else {
                                         onShowMessage("No recognizable Latin script text detected on Page ${currentPageIndex + 1}.")
                                     }
@@ -801,9 +843,13 @@ fun NativePdfViewerScreen(
                             .fillMaxSize()
                             .padding(16.dp)
                     ) {
-                        if (currentText.isBlank()) {
+                        if (displayedText.isBlank()) {
                             Text(
-                                text = "No native text layer on this page. Tap 'Run ML Kit OCR' above to recognize text from this scanned page.",
+                                text = if (inspectOcrTabInSheet) {
+                                    "No ML Kit OCR text cached for this page yet. Tap 'Run ML Kit OCR' above to recognize text from the rendered page bitmap."
+                                } else {
+                                    "This PDF page does not contain an embedded vector text stream. Switch to the 'ML Kit OCR Text' tab or tap 'Run ML Kit OCR' above."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -812,7 +858,7 @@ fun NativePdfViewerScreen(
                                 LazyColumn {
                                     item {
                                         HighlightedSearchText(
-                                            fullText = currentText,
+                                            fullText = displayedText,
                                             query = searchQuery
                                         )
                                     }
@@ -829,33 +875,51 @@ fun NativePdfViewerScreen(
 @OptIn(ExperimentalPdfApi::class)
 @Composable
 private fun JetpackOfficialComposePdfSurface(
-    pdfFile: File,
+    sessionHandle: DecryptedPdfSessionHandle,
     onFallbackRequired: () -> Unit
 ) {
     val context = LocalContext.current
+    val fragmentActivity = context as? FragmentActivity
     val pdfLoader = remember(context) {
         runCatching { SandboxedPdfLoader(context) }.getOrNull()
     }
-    val pdfViewerState = remember { PdfViewerState() }
-    var pdfDocument by remember(pdfFile.absolutePath) { mutableStateOf<PdfDocument?>(null) }
+    var pdfDocument by remember(sessionHandle.sessionId) { mutableStateOf<PdfDocument?>(null) }
+    val containerId = remember(sessionHandle.sessionId) { View.generateViewId() }
 
-    LaunchedEffect(pdfFile.absolutePath) {
-        if (pdfLoader == null) {
+    LaunchedEffect(sessionHandle.sessionId) {
+        if (pdfLoader == null || fragmentActivity == null || sessionHandle.isClosed()) {
             onFallbackRequired()
             return@LaunchedEffect
         }
         try {
-            val uri = Uri.fromFile(pdfFile)
-            pdfDocument = pdfLoader.openDocument(uri)
+            pdfDocument = pdfLoader.openDocument(sessionHandle.fileUri)
         } catch (_: Throwable) {
             onFallbackRequired()
         }
     }
 
-    if (pdfDocument != null) {
-        PdfViewer(
-            pdfDocument = pdfDocument,
-            state = pdfViewerState,
+    if (pdfDocument != null && fragmentActivity != null) {
+        AndroidView(
+            factory = { ctx ->
+                FragmentContainerView(ctx).apply {
+                    id = containerId
+                    post {
+                        runCatching {
+                            val fm = fragmentActivity.supportFragmentManager
+                            if (!fm.isStateSaved) {
+                                val fragment = PdfViewerFragment().apply {
+                                    documentUri = sessionHandle.fileUri
+                                }
+                                fm.beginTransaction()
+                                    .replace(containerId, fragment, "pdf_viewer_${sessionHandle.sessionId}")
+                                    .commitAllowingStateLoss()
+                            }
+                        }.onFailure {
+                            onFallbackRequired()
+                        }
+                    }
+                }
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .testTag("jetpack_compose_pdf_viewer")
@@ -872,30 +936,32 @@ private fun JetpackOfficialComposePdfSurface(
 
 @Composable
 private fun PdfRenderedPageCard(
-    pdfFile: File,
+    sessionHandle: DecryptedPdfSessionHandle,
     pageIndex: Int,
     totalPages: Int,
     pdfEngine: PdfProcessingEngine,
     isSearchMatch: Boolean,
     searchQuery: String,
-    pageText: String?,
+    embeddedText: String?,
+    ocrText: String?,
     onOpenTextSelect: () -> Unit
 ) {
-    var pageBitmap by remember(pdfFile.absolutePath, pageIndex) { mutableStateOf<Bitmap?>(null) }
+    var pageBitmap by remember(sessionHandle.sessionId, pageIndex) { mutableStateOf<Bitmap?>(null) }
 
-    LaunchedEffect(pdfFile.absolutePath, pageIndex) {
-        pageBitmap = pdfEngine.renderPdfPageToBitmap(
-            pdfFile = pdfFile,
-            pageIndex = pageIndex,
-            targetWidthPx = 1280
-        )
+    LaunchedEffect(sessionHandle.sessionId, pageIndex) {
+        if (!sessionHandle.isClosed()) {
+            pageBitmap = pdfEngine.renderPdfPageToBitmap(
+                pdfFile = sessionHandle.decryptedFile,
+                pageIndex = pageIndex,
+                targetWidthPx = 1280
+            )
+        }
     }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // White paper sheet container with natural proportions and subtle elevation
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -930,8 +996,7 @@ private fun PdfRenderedPageCard(
                     modifier = Modifier.align(Alignment.TopEnd)
                 ) {
                     Row(
-                        modifier = Modifier
-                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
@@ -944,7 +1009,6 @@ private fun PdfRenderedPageCard(
             }
         }
 
-        // Page footer metadata & quick text selection chip
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -952,16 +1016,31 @@ private fun PdfRenderedPageCard(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val sourceLabel = when {
+                !embeddedText.isNullOrBlank() && !ocrText.isNullOrBlank() -> "Embedded PDF Text + OCR"
+                !embeddedText.isNullOrBlank() -> "Embedded PDF Text"
+                !ocrText.isNullOrBlank() -> "ML Kit OCR Text"
+                else -> "Page ${pageIndex + 1}"
+            }
             Text(
-                text = "Page ${pageIndex + 1} of $totalPages",
+                text = "Page ${pageIndex + 1} of $totalPages • $sourceLabel",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (!pageText.isNullOrBlank()) {
-                FilterChip(
-                    selected = isSearchMatch,
-                    onClick = onOpenTextSelect,
-                    label = { Text("Select / Copy Page Text") }
+            TextButton(onClick = onOpenTextSelect) {
+                Icon(
+                    imageVector = Icons.Default.TextSnippet,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = if (!embeddedText.isNullOrBlank() || !ocrText.isNullOrBlank()) {
+                        "Select / Copy Text"
+                    } else {
+                        "Run OCR"
+                    },
+                    style = MaterialTheme.typography.labelSmall
                 )
             }
         }
@@ -982,32 +1061,33 @@ private fun HighlightedSearchText(
         return
     }
 
-    val highlightBg = MaterialTheme.colorScheme.tertiaryContainer
-    val highlightFg = MaterialTheme.colorScheme.onTertiaryContainer
-    val annotated = remember(fullText, query, highlightBg, highlightFg) {
+    val highlightColor = MaterialTheme.colorScheme.tertiaryContainer
+    val highlightTextColor = MaterialTheme.colorScheme.onTertiaryContainer
+
+    val annotated = remember(fullText, query, highlightColor, highlightTextColor) {
         buildAnnotatedString {
             var startIndex = 0
-            val lowerFull = fullText.lowercase()
+            val lowerText = fullText.lowercase()
             val lowerQuery = query.lowercase()
             while (startIndex < fullText.length) {
-                val matchIdx = lowerFull.indexOf(lowerQuery, startIndex)
-                if (matchIdx == -1) {
+                val matchIndex = lowerText.indexOf(lowerQuery, startIndex)
+                if (matchIndex == -1) {
                     append(fullText.substring(startIndex))
                     break
                 }
-                if (matchIdx > startIndex) {
-                    append(fullText.substring(startIndex, matchIdx))
+                if (matchIndex > startIndex) {
+                    append(fullText.substring(startIndex, matchIndex))
                 }
                 withStyle(
                     SpanStyle(
-                        background = highlightBg,
-                        color = highlightFg,
+                        background = highlightColor,
+                        color = highlightTextColor,
                         fontWeight = FontWeight.Bold
                     )
                 ) {
-                    append(fullText.substring(matchIdx, matchIdx + query.length))
+                    append(fullText.substring(matchIndex, matchIndex + query.length))
                 }
-                startIndex = matchIdx + query.length
+                startIndex = matchIndex + query.length
             }
         }
     }

@@ -29,10 +29,12 @@ data class UserPreferencesState(
     val defaultEnhancedScan: Boolean = true,
     val isGridView: Boolean = false,
     val pinEnabled: Boolean = false,
+    val biometricUnlockEnabled: Boolean = true,
     val pinSaltBase64: String = "",
     val pinHashBase64: String = "",
     val failedPinAttempts: Int = 0,
-    val lockoutUntilEpochMs: Long = 0L
+    val lockoutUntilEpochMs: Long = 0L,
+    val vaultDisclosureAcknowledged: Boolean = false
 )
 
 class PaperworkPreferencesRepository(private val context: Context) {
@@ -45,10 +47,12 @@ class PaperworkPreferencesRepository(private val context: Context) {
         val DEFAULT_ENHANCED = booleanPreferencesKey("default_enhanced_scan")
         val IS_GRID_VIEW = booleanPreferencesKey("is_grid_view")
         val PIN_ENABLED = booleanPreferencesKey("pin_enabled")
+        val BIOMETRIC_ENABLED = booleanPreferencesKey("biometric_unlock_enabled")
         val PIN_SALT = stringPreferencesKey("pin_salt_b64")
         val PIN_HASH = stringPreferencesKey("pin_hash_b64")
         val FAILED_ATTEMPTS = intPreferencesKey("failed_pin_attempts")
         val LOCKOUT_UNTIL = longPreferencesKey("lockout_until_epoch_ms")
+        val VAULT_DISCLOSURE_ACK = booleanPreferencesKey("vault_disclosure_acknowledged")
     }
 
     val preferencesFlow: Flow<UserPreferencesState> = context.paperworkDataStore.data.map { prefs ->
@@ -68,10 +72,12 @@ class PaperworkPreferencesRepository(private val context: Context) {
             defaultEnhancedScan = prefs[Keys.DEFAULT_ENHANCED] ?: true,
             isGridView = prefs[Keys.IS_GRID_VIEW] ?: false,
             pinEnabled = prefs[Keys.PIN_ENABLED] ?: false,
+            biometricUnlockEnabled = prefs[Keys.BIOMETRIC_ENABLED] ?: true,
             pinSaltBase64 = prefs[Keys.PIN_SALT] ?: "",
             pinHashBase64 = prefs[Keys.PIN_HASH] ?: "",
             failedPinAttempts = prefs[Keys.FAILED_ATTEMPTS] ?: 0,
-            lockoutUntilEpochMs = prefs[Keys.LOCKOUT_UNTIL] ?: 0L
+            lockoutUntilEpochMs = prefs[Keys.LOCKOUT_UNTIL] ?: 0L,
+            vaultDisclosureAcknowledged = prefs[Keys.VAULT_DISCLOSURE_ACK] ?: false
         )
     }
 
@@ -97,6 +103,14 @@ class PaperworkPreferencesRepository(private val context: Context) {
 
     suspend fun setGridView(isGrid: Boolean) {
         context.paperworkDataStore.edit { it[Keys.IS_GRID_VIEW] = isGrid }
+    }
+
+    suspend fun setBiometricUnlockEnabled(enabled: Boolean) {
+        context.paperworkDataStore.edit { it[Keys.BIOMETRIC_ENABLED] = enabled }
+    }
+
+    suspend fun acknowledgeVaultDisclosure() {
+        context.paperworkDataStore.edit { it[Keys.VAULT_DISCLOSURE_ACK] = true }
     }
 
     suspend fun configurePin(salt: ByteArray, hash: ByteArray) {
