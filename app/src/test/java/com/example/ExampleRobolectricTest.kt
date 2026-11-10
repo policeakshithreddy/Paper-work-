@@ -38,10 +38,17 @@ import java.io.File
 class ExampleRobolectricTest {
 
     @Test
-    fun `verify app name is Paperwork`() {
+    fun `verify app name is Paperwork and MainActivity launches cleanly without crashing`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
         assertEquals("Paperwork", appName)
+
+        org.robolectric.Robolectric.buildActivity(MainActivity::class.java).use { controller ->
+            controller.setup()
+            val activity = controller.get()
+            assertNotNull(activity)
+            assertFalse(activity.isFinishing)
+        }
     }
 
     @Test
