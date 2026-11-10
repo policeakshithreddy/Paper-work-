@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude domain="file" path="vault_pdfs"/>
+    <exclude domain="file" path="vault_scans"/>
+    <exclude domain="file" path="vault_thumbs"/>
+    <exclude domain="database" path="paperwork_vault.db"/>
+    <exclude domain="database" path="paperwork_vault.db-wal"/>
+    <exclude domain="database" path="paperwork_vault.db-shm"/>
+    <exclude domain="file" path="datastore"/>
+</full-backup-content>
