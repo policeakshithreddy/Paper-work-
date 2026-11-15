@@ -1,58 +1,52 @@
 package com.example
 
 import android.app.Application
+import android.content.Context
 import androidx.room.Room
 import com.example.core.pdf.PdfProcessingEngine
-import com.example.core.pdf.SecureDocumentAccessManager
-import com.example.core.security.AppAccessLockManager
-import com.example.core.security.VaultCryptoManager
 import com.example.data.local.PaperworkDatabase
 import com.example.data.preferences.PaperworkPreferencesRepository
 import com.example.data.repository.DocumentRepository
-import com.example.features.printing.PaperworkPrintHelper
+import java.io.File
+import java.security.KeyStore
+
+class LegacyVaultResetManager(private val context: Context) {
+    private val legacyDatabase = "paperwork_vault.db"
+
+    fun needsReset(): Boolean = context.getDatabasePath(legacyDatabase).exists() ||
+        listOf("vault_pdfs", "vault_scans", "vault_thumbs").any { File(context.filesDir, it).exists() }
+
+    fun clearLegacyData() {
+        context.deleteDatabase(legacyDatabase)
+        listOf("vault_pdfs", "vault_scans", "vault_thumbs").forEach { name ->
+            File(context.filesDir, name).deleteRecursively()
+        }
+        File(context.cacheDir, "active_session_tmp").deleteRecursively()
+        runCatching {
+            val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            keyStore.aliases().toList()
+                .filter { it.startsWith("paperwork_vault_aes_256_gcm_v") }
+                .forEach { alias -> keyStore.deleteEntry(alias) }
+        }
+        context.getSharedPreferences("paperwork_keystore_version_meta", Context.MODE_PRIVATE).edit().clear().apply()
+        File(context.filesDir, "datastore/paperwork_preferences.preferences_pb").delete()
+    }
+}
 
 class PaperworkContainer(context: Application) {
-    val cryptoManager = VaultCryptoManager(context)
-    val accessLockManager = AppAccessLockManager(context)
-    val secureDocumentAccessManager = SecureDocumentAccessManager(context, cryptoManager)
-
-    private val database: PaperworkDatabase = Room.databaseBuilder(
-        context,
-        PaperworkDatabase::class.java,
-        "paperwork_vault.db"
-    )
-        .fallbackToDestructiveMigration(dropAllTables = true)
-        .build()
-
+    private val database = Room.databaseBuilder(context, PaperworkDatabase::class.java, "paperwork_workspace.db").build()
     val pdfEngine = PdfProcessingEngine(context)
-
     val preferencesRepository = PaperworkPreferencesRepository(context)
-
-    val documentRepository = DocumentRepository(
-        context = context,
-        documentDao = database.documentDao(),
-        cryptoManager = cryptoManager,
-        pdfEngine = pdfEngine,
-        secureDocumentAccessManager = secureDocumentAccessManager
-    )
-
-    val printHelper = PaperworkPrintHelper(
-        context = context,
-        cryptoManager = cryptoManager,
-        pdfEngine = pdfEngine,
-        secureAccessManager = secureDocumentAccessManager
-    )
+    val documentRepository = DocumentRepository(context, database.documentDao(), pdfEngine)
+    val legacyResetManager = LegacyVaultResetManager(context)
 }
 
 class PaperworkApplication : Application() {
-
     lateinit var container: PaperworkContainer
         private set
 
     override fun onCreate() {
         super.onCreate()
         container = PaperworkContainer(this)
-        // Clean up any orphaned decrypted temporary session files from previous runs
-        container.secureDocumentAccessManager.cleanupAbandonedSessions()
     }
 }

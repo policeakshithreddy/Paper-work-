@@ -1,11 +1,7 @@
-import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
-
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
-  alias(libs.plugins.secrets)
-  alias(libs.plugins.google.services)
 }
 
 android {
@@ -16,43 +12,46 @@ android {
     applicationId = "com.aistudio.paperwork.pwxkqm"
     minSdk = 28
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 2
+    versionName = "2.0.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
-  // Do not remove or modify these signingConfigs. They are necessary for building, installing,
-  // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
-    }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+      val storePath = System.getenv("SIGNING_STORE_FILE")
+      val storePasswordValue = System.getenv("SIGNING_STORE_PASSWORD")
+      val aliasValue = System.getenv("SIGNING_KEY_ALIAS")
+      val keyPasswordValue = System.getenv("SIGNING_KEY_PASSWORD")
+      if (!storePath.isNullOrBlank() && !storePasswordValue.isNullOrBlank() &&
+        !aliasValue.isNullOrBlank() && !keyPasswordValue.isNullOrBlank()
+      ) {
+        storeFile = file(storePath)
+        storePassword = storePasswordValue
+        keyAlias = aliasValue
+        keyPassword = keyPasswordValue
+      }
     }
   }
 
   buildTypes {
+    debug {
+      applicationIdSuffix = ".debug"
+      versionNameSuffix = "-debug"
+    }
     release {
       isCrunchPngs = false
-      isMinifyEnabled = false
+      isMinifyEnabled = true
+      isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("release")
-    }
-    debug {
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("debugConfig")
+      val signingConfigured = listOf(
+        System.getenv("SIGNING_STORE_FILE"),
+        System.getenv("SIGNING_STORE_PASSWORD"),
+        System.getenv("SIGNING_KEY_ALIAS"),
+        System.getenv("SIGNING_KEY_PASSWORD")
+      ).all { !it.isNullOrBlank() }
+      if (signingConfigured) signingConfig = signingConfigs.getByName("release")
     }
   }
   compileOptions {
@@ -70,28 +69,31 @@ android {
   }
 }
 
-secrets {
-  propertiesFileName = ".env"
-  defaultPropertiesFileName = ".env.example"
-  ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+val validateProductionSigning by tasks.registering {
+  doLast {
+    val required = listOf("SIGNING_STORE_FILE", "SIGNING_STORE_PASSWORD", "SIGNING_KEY_ALIAS", "SIGNING_KEY_PASSWORD")
+    check(required.all { !System.getenv(it).isNullOrBlank() }) {
+      "Release signing requires SIGNING_STORE_FILE, SIGNING_STORE_PASSWORD, SIGNING_KEY_ALIAS and SIGNING_KEY_PASSWORD. No debug-key fallback is allowed."
+    }
+    check(file(System.getenv("SIGNING_STORE_FILE")).isFile) { "The release signing file does not exist." }
+  }
 }
-
-googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
+tasks.matching { it.name == "packageRelease" || it.name == "signReleaseBundle" }.configureEach {
+  dependsOn(validateProductionSigning)
+}
 
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
   implementation(libs.androidx.activity.compose)
   implementation(libs.androidx.appcompat)
   implementation(libs.androidx.fragment.ktx)
-  implementation(libs.androidx.biometric)
   implementation(libs.androidx.exifinterface)
-  implementation(libs.androidx.camera.camera2)
-  implementation(libs.androidx.camera.core)
-  implementation(libs.androidx.camera.lifecycle)
-  implementation(libs.androidx.camera.view)
   implementation(libs.androidx.compose.material.icons.core)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)
+  implementation("androidx.compose.material3:material3-adaptive-navigation-suite:1.4.0")
+  implementation("androidx.compose.material3.adaptive:adaptive-layout:1.1.0")
+  implementation("androidx.compose.material3.adaptive:adaptive-navigation:1.1.0")
   implementation(libs.androidx.compose.material3.window.size)
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.graphics)
@@ -101,17 +103,15 @@ dependencies {
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.lifecycle.viewmodel.compose)
-  implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
-  implementation(libs.coil.compose)
-
-  implementation(libs.androidx.pdf.viewer)
-  implementation(libs.androidx.pdf.viewer.fragment)
-  implementation(libs.androidx.pdf.document.service)
-  implementation(libs.androidx.pdf.ocr.play.services)
 
   implementation(libs.pdfbox.android)
+  constraints {
+    implementation("org.bouncycastle:bcprov-jdk15to18:1.87")
+    implementation("org.bouncycastle:bcpkix-jdk15to18:1.87")
+    implementation("org.bouncycastle:bcutil-jdk15to18:1.87")
+  }
   implementation(libs.play.services.mlkit.document.scanner)
   implementation(libs.play.services.mlkit.text.recognition)
 
@@ -132,4 +132,19 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
+}
+
+dependencyLocking { lockAllConfigurations() }
+
+tasks.register("writeRuntimeDependencyInventory") {
+  val runtime = configurations.named("releaseRuntimeClasspath")
+  val report = layout.buildDirectory.file("reports/runtime-dependencies.tsv")
+  outputs.file(report)
+  doLast {
+    val rows = runtime.get().resolvedConfiguration.resolvedArtifacts.map {
+      val id = it.moduleVersion.id
+      "${id.group}:${id.name}\t${id.version}"
+    }.distinct().sorted()
+    report.get().asFile.apply { parentFile.mkdirs(); writeText(rows.joinToString("\n") + "\n") }
+  }
 }

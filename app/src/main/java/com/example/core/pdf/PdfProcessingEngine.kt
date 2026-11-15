@@ -586,195 +586,125 @@ class PdfProcessingEngine(private val context: Context) {
     suspend fun recognizeTextWithMlKit(bitmap: Bitmap): String =
         ocrService.recognizeBitmapText(bitmap)
 
+
     /**
-     * Generates a genuine vector text-layer multi-page PDF using Apache `pdfbox-android`
-     * so users can immediately test native text selection, inline search, and reverse printing.
+     * Encodes a bitmap to JPEG or PNG with physical DPI headers embedded (JFIF for JPEG, pHYs for PNG).
      */
-    suspend fun createSampleVectorPdf(targetFile: File) = withContext(Dispatchers.IO) {
-        PDDocument().use { doc ->
-            val pagesContent = listOf(
-                Triple(
-                    "Paperwork - Architecture & Security Guide (Page 1 of 3)",
-                    "1. Versioned Local Vault (AES-256-GCM)",
-                    listOf(
-                        "Welcome to Paperwork, a native Google Pixel-style document utility.",
-                        "Every document, thumbnail, original scan, and metadata record is encrypted",
-                        "at rest using Android Keystore AES-256-GCM with a 19-byte PWKV header.",
-                        "",
-                        "Key Highlights:",
-                        "- Native Jetpack PDF Viewer (androidx.pdf 1.0.0-beta01) with Compose support.",
-                        "- Reversible Original, Enhanced Color, and Ink-Saving Grayscale scanning.",
-                        "- Non-rasterizing PDF page manipulation via Apache PDFBox-Android.",
-                        "- Native Android PrintManager integration with Reverse Page Ordering (N -> 1).",
-                        "",
-                        "Try searching for 'Keystore', 'Reverse', or 'Vector' using the search icon above!"
-                    )
-                ),
-                Triple(
-                    "Paperwork - Service Invoice #PW-2026-084 (Page 2 of 3)",
-                    "2. Itemized Equipment & Cloud-Free Processing Summary",
-                    listOf(
-                        "Billed To: Alex Rivera, Principal Product Architect",
-                        "Date: November 10, 2026   |   Payment Status: PAID IN FULL",
-                        "",
-                        "Line 01: On-Device ML Kit Document Scanner License .......... $0.00 (Included)",
-                        "Line 02: Local AES-256-GCM Keystore Vault Storage ........... $0.00 (Offline)",
-                        "Line 03: Multi-Page A4 / Letter / Legal Conversion Engine ... $0.00 (Included)",
-                        "Line 04: Reverse Page Order Print Spooler Module ............ $0.00 (Included)",
-                        "",
-                        "Subtotal: $0.00   |   Tax (0%): $0.00   |   Total Due: $0.00",
-                        "Notes: All document processing executes strictly on your Android device."
-                    )
-                ),
-                Triple(
-                    "Paperwork - Print & Verification Checklist (Page 3 of 3)",
-                    "3. Reverse Page Order & OCR Verification Notes",
-                    listOf(
-                        "When printing multi-page contracts on deskjet or laser printers that stack",
-                        "pages face-up, enable 'Reverse order (N -> 1)' in the Paperwork Print Sheet.",
-                        "",
-                        "Verification Steps:",
-                        "1. Tap the Print icon in the top bar or document menu.",
-                        "2. Select 'Reverse order (N -> 1)' to print Page 3, then Page 2, then Page 1.",
-                        "3. Select text directly on this vector PDF page to copy or share.",
-                        "4. Open the Scanned Receipt sample to test Original vs. Enhanced Color."
-                    )
-                )
-            )
+    fun encodeBitmapWithDpi(
+        bitmap: Bitmap,
+        format: com.example.domain.model.ScanOutputFormat,
+        dpi: Int = 300,
+        qualityPercent: Int = 90
+    ): ByteArray {
+        val stream = ByteArrayOutputStream()
+        val compressFormat = if (format == com.example.domain.model.ScanOutputFormat.PNG) {
+            Bitmap.CompressFormat.PNG
+        } else {
+            Bitmap.CompressFormat.JPEG
+        }
+        bitmap.compress(compressFormat, qualityPercent.coerceIn(10, 100), stream)
+        val rawBytes = stream.toByteArray()
 
-            pagesContent.forEach { (header, subtitle, lines) ->
-                val page = PDPage(PDRectangle.A4)
-                doc.addPage(page)
-                PDPageContentStream(doc, page).use { stream ->
-                    stream.setNonStrokingColor(11, 87, 208)
-                    stream.addRect(48f, 750f, 500f, 44f)
-                    stream.fill()
-
-                    stream.beginText()
-                    stream.setNonStrokingColor(255, 255, 255)
-                    stream.setFont(PDType1Font.HELVETICA_BOLD, 13f)
-                    stream.newLineAtOffset(62f, 767f)
-                    stream.showText(header)
-                    stream.endText()
-
-                    stream.beginText()
-                    stream.setNonStrokingColor(20, 28, 36)
-                    stream.setFont(PDType1Font.HELVETICA_BOLD, 16f)
-                    stream.newLineAtOffset(48f, 705f)
-                    stream.showText(subtitle)
-                    stream.endText()
-
-                    var y = 668f
-                    lines.forEach { line ->
-                        if (line.isNotEmpty()) {
-                            stream.beginText()
-                            stream.setNonStrokingColor(45, 52, 62)
-                            stream.setFont(PDType1Font.HELVETICA, 11.5f)
-                            stream.newLineAtOffset(48f, y)
-                            stream.showText(line)
-                            stream.endText()
-                        }
-                        y -= 24f
-                    }
-
-                    stream.beginText()
-                    stream.setNonStrokingColor(115, 119, 127)
-                    stream.setFont(PDType1Font.COURIER, 9.5f)
-                    stream.newLineAtOffset(48f, 48f)
-                    stream.showText("Generated locally by Paperwork | Vector PDF Layer Intact | Zero Cloud Upload")
-                    stream.endText()
-                }
-            }
-            doc.save(targetFile)
+        return if (format == com.example.domain.model.ScanOutputFormat.JPEG) {
+            embedJpegJfifDpi(rawBytes, dpi)
+        } else {
+            embedPngPhysDpi(rawBytes, dpi)
         }
     }
 
     /**
-     * Generates a realistic 2-page "Scanned Field Receipt & Inspection Form" with warm shadowed
-     * original bitmaps and a cobalt-blue approval stamp so the user can immediately verify that
-     * Enhanced Color preserves color stamps while cleaning paper shadows.
+     * Bundles multiple scanned pages as discrete image files into a single ZIP archive.
      */
-    fun createSampleScannedBitmaps(): List<Bitmap> {
-        val page1 = Bitmap.createBitmap(900, 1260, Bitmap.Config.ARGB_8888)
-        Canvas(page1).apply {
-            drawColor(Color.rgb(236, 231, 220))
-            val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(32, 42, 58)
-                textSize = 34f
-                typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
-            }
-            val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(52, 56, 64)
-                textSize = 24f
-                typeface = Typeface.MONOSPACE
-            }
-            val stampPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(11, 87, 208)
-                textSize = 26f
-                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            }
-            val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(180, 174, 162)
-                style = Paint.Style.STROKE
-                strokeWidth = 3f
-            }
-            drawRect(56f, 56f, 844f, 1204f, boxPaint)
-            drawText("PACIFIC HARDWARE & SUPPLY CO.", 96f, 140f, headerPaint)
-            drawText("RECEIPT #88412-A   |   SAN FRANCISCO, CA", 96f, 195f, bodyPaint)
-            drawLine(96f, 225f, 804f, 225f, boxPaint)
+    suspend fun buildZipFromBitmaps(
+        pages: List<PageImageSpec>,
+        format: com.example.domain.model.ScanOutputFormat,
+        dpi: Int = 300,
+        qualityPercent: Int = 90,
+        onProgress: ((done: Int, total: Int) -> Unit)? = null
+    ): ByteArray = withContext(Dispatchers.Default) {
+        val byteOut = ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(byteOut).use { zipOut ->
+            pages.forEachIndexed { index, spec ->
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val rotated = rotateBitmap(spec.bitmap, spec.rotationDegrees)
+                val encodedBytes = encodeBitmapWithDpi(rotated, format, dpi, qualityPercent)
 
-            val items = listOf(
-                "1x Heavy Duty Document Folder ........ $14.50",
-                "2x Archival Fountain Ink (Cobalt) .... $38.00",
-                "1x A4 Recycled Cotton Paper Ream ..... $22.00",
-                "1x Portable USB-C Desk Lamp .......... $49.00",
-                "---------------------------------------------",
-                "SUBTOTAL ............................. $123.50",
-                "CA STATE TAX (8.625%) ................ $10.65",
-                "TOTAL CHARGED (VISA *4092) ........... $134.15",
-                "",
-                "CUSTOMER COPY - RETAIN FOR WARRANTY & TAX LOG",
-                "OCR Verification Code: PW-SCAN-9940-LATIN"
-            )
-            var y = 290f
-            for (line in items) {
-                drawText(line, 96f, y, bodyPaint)
-                y += 54f
-            }
-            drawText("[APPROVED IN COLOR - COBALT STAMP]", 96f, 960f, stampPaint)
-        }
+                val ext = if (format == com.example.domain.model.ScanOutputFormat.PNG) "png" else "jpg"
+                val entryName = String.format(java.util.Locale.US, "scan_%03d.%s", index + 1, ext)
+                val zipEntry = java.util.zip.ZipEntry(entryName)
+                zipOut.putNextEntry(zipEntry)
+                zipOut.write(encodedBytes)
+                zipOut.closeEntry()
 
-        val page2 = Bitmap.createBitmap(900, 1260, Bitmap.Config.ARGB_8888)
-        Canvas(page2).apply {
-            drawColor(Color.rgb(234, 229, 218))
-            val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(25, 65, 110)
-                textSize = 32f
-                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            }
-            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.rgb(48, 52, 60)
-                textSize = 23f
-                typeface = Typeface.SANS_SERIF
-            }
-            drawText("DELIVERY & EQUIPMENT SIGN-OFF (PAGE 2)", 96f, 140f, titlePaint)
-            val notes = listOf(
-                "Inspector: Jordan Vance",
-                "Location: Warehouse Dock B - Receiving",
-                "Condition: All crates sealed and verified intact.",
-                "",
-                "Original Scan Preservation Note:",
-                "Paperwork stores both this warm, unprocessed camera capture",
-                "(Original) and the color-preserving enhanced document layer.",
-                "You can switch between Original, Enhanced Color, and Grayscale anytime."
-            )
-            var y = 230f
-            for (line in notes) {
-                drawText(line, 96f, y, textPaint)
-                y += 50f
+                onProgress?.invoke(index + 1, pages.size)
             }
         }
+        byteOut.toByteArray()
+    }
 
-        return listOf(page1, page2)
+    private fun embedJpegJfifDpi(data: ByteArray, dpi: Int): ByteArray {
+        if (data.size >= 4 && data[0] == 0xFF.toByte() && data[1] == 0xD8.toByte()) {
+            if (data.size >= 14 && data[2] == 0xFF.toByte() && data[3] == 0xE0.toByte() &&
+                data[6] == 'J'.code.toByte() && data[7] == 'F'.code.toByte() &&
+                data[8] == 'I'.code.toByte() && data[9] == 'F'.code.toByte()
+            ) {
+                val copy = data.clone()
+                copy[13] = 1 // dots per inch
+                copy[14] = ((dpi shr 8) and 0xFF).toByte()
+                copy[15] = (dpi and 0xFF).toByte()
+                copy[16] = ((dpi shr 8) and 0xFF).toByte()
+                copy[17] = (dpi and 0xFF).toByte()
+                return copy
+            }
+            // Inject JFIF APP0 segment right after SOI (0xFFD8)
+            val jfif = byteArrayOf(
+                0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(),
+                0x00, 0x10, 'J'.code.toByte(), 'F'.code.toByte(), 'I'.code.toByte(), 'F'.code.toByte(), 0x00,
+                0x01, 0x01, 0x01,
+                ((dpi shr 8) and 0xFF).toByte(), (dpi and 0xFF).toByte(),
+                ((dpi shr 8) and 0xFF).toByte(), (dpi and 0xFF).toByte(),
+                0x00, 0x00
+            )
+            val result = ByteArray(jfif.size + data.size - 2)
+            System.arraycopy(jfif, 0, result, 0, jfif.size)
+            System.arraycopy(data, 2, result, jfif.size, data.size - 2)
+            return result
+        }
+        return data
+    }
+
+    private fun embedPngPhysDpi(data: ByteArray, dpi: Int): ByteArray {
+        val ppm = Math.round(dpi * 39.3701).toInt()
+        val ppmData = ByteArray(9)
+        val buf = java.nio.ByteBuffer.wrap(ppmData)
+        buf.putInt(ppm)
+        buf.putInt(ppm)
+        ppmData[8] = 1 // Meter unit
+
+        val chunkType = byteArrayOf('p'.code.toByte(), 'H'.code.toByte(), 'Y'.code.toByte(), 's'.code.toByte())
+        val chunkData = ByteArray(4 + 9)
+        System.arraycopy(chunkType, 0, chunkData, 0, 4)
+        System.arraycopy(ppmData, 0, chunkData, 4, 9)
+
+        val crc32 = java.util.zip.CRC32()
+        crc32.update(chunkData)
+        val crcVal = crc32.value.toInt()
+
+        val physChunk = ByteArray(4 + 4 + 9 + 4)
+        val chunkBuf = java.nio.ByteBuffer.wrap(physChunk)
+        chunkBuf.putInt(9)
+        chunkBuf.put(chunkType)
+        chunkBuf.put(ppmData)
+        chunkBuf.putInt(crcVal)
+
+        // Insert physChunk after PNG header + IHDR (offset 8 + 25 = 33)
+        if (data.size > 33) {
+            val result = ByteArray(data.size + physChunk.size)
+            System.arraycopy(data, 0, result, 0, 33)
+            System.arraycopy(physChunk, 0, result, 33, physChunk.size)
+            System.arraycopy(data, 33, result, 33 + physChunk.size, data.size - 33)
+            return result
+        }
+        return data
     }
 }

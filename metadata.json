@@ -1,6 +1,1 @@
-{
-  "name": "Paperwork",
-  "description": "Pixel-inspired Material 3 Expressive document scanner, native Jetpack PDF viewer with OCR, image-to-PDF converter, and reverse-order print utility with Android Keystore AES-256-GCM encryption.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
+{"name":"Paperwork","description":"An adaptive Material 3 document workspace for scanning, reading, converting, sharing and printing.","requestFramePermissions":[],"majorCapabilities":[]}
